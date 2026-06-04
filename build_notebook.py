@@ -2,12 +2,73 @@
 """Builder: assembles the RiskGuardian cyber-risk notebook via nbformat.
 Run with the MLENV311 interpreter so the kernelspec/lib assumptions match.
 """
+import base64, os, pathlib, re
 import nbformat as nbf
 
 nb = nbf.v4.new_notebook()
 cells = []
 def md(s):   cells.append(nbf.v4.new_markdown_cell(s.strip("\n")))
 def code(s): cells.append(nbf.v4.new_code_cell(s.strip("\n")))
+
+# ── Header styling: "the_plotly_thickens" brand-green hierarchy ───────────
+# Three-tier ramp derived from the logo's signature forest green (#3E6048),
+# darkening with header depth (mirrors Gavin's blue JHU-styler system).
+H1_COLOR = "#22442C"  # deep forest  — major sections
+H2_COLOR = "#40634A"  # brand green  — sub-sections
+H3_COLOR = "#7EA98B"  # light sage   — sub-sub-sections (italic)
+
+# H3 headers that should stay unstyled (procedural/structural markers).
+H3_SKIP_PATTERNS = [r"^###\s+Step\s+\d+", r"^###\s+Note\s+on\b",
+                    r"^###\s+Correlation\s+Analysis", r"^###\s+\d+\."]
+
+def _style_header_line(line):
+    """Style a single markdown header line with the brand-green palette.
+    Idempotent (skips lines already carrying <span>/<em>/<font>)."""
+    if any(t in line for t in ("<span", "<em ", "<font")):
+        return line
+    if re.match(r"^# (?!#)", line):
+        return f'# <span style="color:{H1_COLOR}">{line[2:].strip()}</span>'
+    if re.match(r"^## (?!#)", line):
+        return f'## <span style="color:{H2_COLOR}">{line[3:].strip()}</span>'
+    if re.match(r"^### (?!#)", line):
+        if any(re.match(p, line.strip()) for p in H3_SKIP_PATTERNS):
+            return line
+        return f'### <em style="color:{H3_COLOR}">{line[4:].strip("*_ ")}</em>'
+    return line
+
+def style_headers():
+    """Apply the brand-green hierarchy to every markdown header line in-place."""
+    n = 0
+    for c in cells:
+        if c.cell_type != "markdown":
+            continue
+        lines = c.source.split("\n")
+        new = [_style_header_line(ln) if ln[:2] == "# " or ln[:3] == "## " or ln[:4] == "### " else ln
+               for ln in lines]
+        if new != lines:
+            c.source = "\n".join(new); n += 1
+    print(f"styled headers in {n} markdown cells (brand-green hierarchy)")
+
+# ── Build-time image embedding: base64-inline PNGs so the .ipynb is self-contained ──
+_HERE = pathlib.Path(__file__).resolve().parent
+_ASSETS = _HERE.parent / "assets"
+HERO_IMG = _ASSETS / "jhu-hackathon-hero-tpt.png"
+LOGO_IMG = _ASSETS / "the_plot_thickens_logo_alpha.png"
+
+def img_md(path, alt, width):
+    p = pathlib.Path(path)
+    if not p.exists():
+        print(f"WARNING: image not found, skipping embed: {p}")
+        return ""
+    data = base64.b64encode(p.read_bytes()).decode()
+    return (f'<div align="center"><img src="data:image/png;base64,{data}" '
+            f'alt="{alt}" width="{width}" /></div>')
+
+# ════════════════════════════════════════════════════════════════════════
+# Hero header (cell 0): full-width base64-embedded banner.
+_hero = img_md(HERO_IMG, "the_plotly_thickens — RiskGuardian", "100%")
+if _hero:
+    md(_hero)
 
 # ════════════════════════════════════════════════════════════════════════
 md(r'''
@@ -1020,14 +1081,15 @@ upload **this notebook** as the solution file (FAQ #2 note). Submissions are **u
 work must be **original** — plagiarism means disqualification.
 
 > ✅ **The dataset has been released.** The released task is **binary text classification**, not the
-> synthetic tabular `risk_class` modeled above — so the **authoritative leaderboard submission is produced
-> in Part XVI** (below) from the real `combined_risk_*.csv` files. The cell here is kept only as a
-> **format/validation demo** on the synthetic split and writes to `submission_synthetic_demo.csv` so it
-> never collides with the real `submission.csv`.
+> synthetic tabular `risk_class` modeled above — so the **graded `submission.csv` is produced by the
+> pure-GenAI predictor in Part XVII** (FAQ #8) from the real `combined_risk_*.csv` files. Part XVI fits a
+> classical baseline for comparison only. The cell here is kept only as a **format/validation demo** on the
+> synthetic split and writes to `submission_synthetic_demo.csv` so it never collides with the real
+> `submission.csv`.
 ''')
 
 code(r'''
-# ── Format/validation DEMO on the synthetic split (real submission is in Part XVI) ──
+# ── Format/validation DEMO on the synthetic split (graded submission is in Part XVII) ──
 # Writes submission_synthetic_demo.csv so it never collides with the real submission.csv.
 ID_COL, TARGET_COL = "Id", "risk_class"
 
@@ -1093,7 +1155,11 @@ scoring), *Detect* (anomaly detection), *Respond* (chaining-prioritized backlog,
 
 # ════════════════════════════════════════════════════════════════════════
 md(r'''
-## Part XVI — Real dataset: text classification & leaderboard submission
+> ⚙️ **Exploratory baseline — NOT part of the graded submission.** Part XVI builds a classical TF-IDF → SVM
+> model as a reference point only. The graded submission is produced solely by the GenAI predictor in
+> **Part XVII** (FAQ #8). No classical prediction is written to `submission.csv`.
+
+## Part XVI — Real dataset: text classification (exploratory classical baseline)
 
 The released task is **binary text classification** on `combined_risk_train.csv` /
 `combined_risk_test.csv` (columns `id, text, label`), scored on **Accuracy** (FAQ #3). This is a
@@ -1191,7 +1257,9 @@ if acc_cln: print(f"  - clean ISOT-news subset:      {np.mean(acc_cln):.4f}")
 ''')
 
 code(r'''
-# ── Fit on ALL train, predict the 70 test rows, write & validate submission ──
+# ── Exploratory baseline: fit on ALL train, predict the 70 test rows, validate FORMAT ──
+# NOTE: this classical model is a reference point only. It does NOT write submission.csv —
+# the graded submission is produced solely by the GenAI predictor in Part XVII (FAQ #8).
 Xr_test = rt_te["text"].values
 svc  = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(Xr, yr)
 pred = svc.predict(Xr_test).astype(int)
@@ -1206,10 +1274,10 @@ if "is_obf" in rt_te:                          # structural rule: clean -> Reute
 print(f"confidence cross-checks  ->  LinearSVC vs LogReg: {agree_lr}/70" +
       (f"   |  SVC vs structural rule: {agree_struct}/70" if agree_struct is not None else ""))
 
-# Build submission to match Sample_Submission.csv EXACTLY (FAQ #1, #2).
+# Demonstrate the exact submission FORMAT against Sample_Submission.csv (FAQ #1, #2).
+# (Built in-memory only — NOT written to submission.csv; Part XVII writes the graded file.)
 sample = pd.read_csv("Sample_Submission.csv")
 sub = pd.DataFrame({"id": rt_te["id"].values, "label": pred})[list(sample.columns)]
-sub.to_csv("submission.csv", index=False)
 
 checks = {
     "exactly 2 columns":                  sub.shape[1] == 2,
@@ -1220,8 +1288,9 @@ checks = {
     "no missing predictions":             bool(sub.notna().all().all()),
 }
 for k, v in checks.items(): print("PASS" if v else "FAIL", "-", k)
-print("\nSUBMISSION VALID:", all(checks.values()),
-      "| label counts:", sub["label"].value_counts().to_dict())
+print("\nFORMAT VALID:", all(checks.values()),
+      "| classical baseline label counts:", sub["label"].value_counts().to_dict())
+print("(exploratory baseline — submission.csv is written by the GenAI predictor in Part XVII)")
 display(sub.head(8))
 ''')
 
@@ -1280,14 +1349,15 @@ display(top_table(order[:12]))
 ''')
 
 # ════════════════════════════════════════════════════════════════════════
-md(r'''
+md(img_md(LOGO_IMG, "the_plot_thickens", "320") + "\n\n" + r'''
+> ⭐ **This is the graded submission — pure GenAI / prompt engineering, FAQ #8 compliant.**
+
 ## Part XVII — GenAI predictor: few-shot LLM classification (Anthropic Claude)
 
-The brief asks for predictions via **prompt engineering with a pre-trained LLM** (FAQ #8). Parts XIV–XVI
-use a classical TF-IDF → SVM model — excellent accuracy, but *not* GenAI. This part makes the **LLM the
-primary predictor**: it few-shot-prompts **Anthropic Claude** to label all 70 test rows and writes that as
-`submission.csv`. The classical model is retained as a **confidence backstop** (`submission_classical.csv`)
-and to fill in any failed API call.
+The brief asks for predictions via **prompt engineering with a pre-trained LLM** (FAQ #8). This part is the
+**sole submission**: it few-shot-prompts **Anthropic Claude** to label all 70 test rows and writes that as
+`submission.csv`. **Every label comes from the LLM** — no classical model is in the prediction path. Parts
+IV–XVI (including the TF-IDF → SVM model) are **exploratory and are NOT submitted**.
 
 **Why prompt engineering is non-trivial here.** The true label rule for the ~2/3 *news* portion is
 **fake-vs-real**, not "cyber vs financial" — unknowable from the brief alone. So the engineered prompt
@@ -1295,9 +1365,47 @@ encodes the structure we discovered (two text types; for news, neutral newswire 
 sensational clickbait = 0) and supplies **few-shot examples spanning all four quadrants** (obfuscated
 cyber/financial + clean fake/real). The validation cell quantifies the **lift over a naive prompt**.
 
-> **Honesty (it's a risk product):** an LLM here typically **trails** the linear model's ~99.99%. Because
-> submissions are unlimited (FAQ #5), `submission.csv` is the GenAI-compliant entry and
-> `submission_classical.csv` is the max-accuracy entry — submit whichever the rules reward.
+> **Pure GenAI (FAQ #8):** the only inputs to `submission.csv` are the LLM's responses. Failed API calls
+> are retried with the LLM; a row that still cannot be resolved defaults to label 0 as a last resort — never
+> to a classical prediction.
+''')
+
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
+### The prompt-engineering story
+
+**The hard part of this task wasn't classifying — it was figuring out what the
+labels mean.**
+
+**1. The corpus is two datasets in a trench coat.** About one-third of the rows are
+obfuscated synthetic risk reports (characters deliberately scrambled and typo'd);
+the other two-thirds are clean news articles from the ISOT fake/real news set. The
+`0/1` label means *different things* in each: for risk reports, `0` = cybersecurity
+and `1` = financial; for news, `0` = sensational/fake and `1` = neutral newswire.
+
+**2. Why a naive prompt fails.** "Classify as Cybersecurity (0) or Financial (1)" —
+the obvious reading of the brief — is meaningless for two-thirds of the data,
+because the news rows aren't about cyber or finance at all. A naive prompt scores
+only ~0.85; the brief alone never tells you the news rule is fake-vs-real.
+
+**3. The engineered prompt.** We encode the structure we discovered: a system
+instruction that names both text types and their separate label rules, plus a
+few-shot bank with two worked examples per quadrant (obfuscated-cyber,
+obfuscated-financial, news-fake, news-real). Temperature 0, single-character output.
+This lifts held-out accuracy from ~0.85 (naive) to 1.00 (engineered).
+
+**4. Reasoning from content, not leakage.** The literal substring "Reuters"
+separates real from fake almost perfectly in training — but that's label leakage
+that need not hold on unseen data. Our prompt is built to reason from *content* —
+tone, sourcing, dateline style — not to grep for a magic word. Evidence: on id=37, a
+calm, clean, **non-Reuters** story about an Obama book deal, the model correctly
+reads it as the fake-news half, where two newer models over-trusted the "sounds
+real" surface and got it wrong.
+
+**5. Honest validation.** We score on a labeled holdout drawn evenly from all four
+quadrants (never the few-shot examples), report per-quadrant accuracy, and count
+call failures. The submission is written from the LLM only — no classical model in
+the prediction path (FAQ #8).
 ''')
 
 code(r'''
@@ -1384,7 +1492,7 @@ def classify(text, system=SYSTEM, shots=SHOTS, model=ANTHROPIC_MODEL, retries=8)
             r.raise_for_status()
         except requests.RequestException:
             time.sleep(delay + random.uniform(0, 0.5)); delay = min(delay * 2, 30)
-    print("  gave up on one row after", retries, "tries"); return -1   # caller falls back to classical
+    print("  gave up on one row after", retries, "tries"); return -1   # unresolved; caller retries then defaults to 0
 
 def classify_many(texts, system=SYSTEM, workers=4):
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -1422,38 +1530,108 @@ eacc = np.mean([vp[sub_i[k]] == vy[sub_i[k]] for k in range(len(sub_i)) if vp[su
 print(f"\nprompt-engineering lift on the same {len(sub_i)} rows ->  naive: {nacc:.3f}   engineered: {eacc:.3f}")
 ''')
 
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
+Prompt-engineering lift and per-quadrant accuracy, from the held-out validation above.
+''')
+
 code(r'''
-# ── Predict the 70 test rows with the LLM = PRIMARY submission ──────────
+# ── Viz 1: naive vs engineered prompt accuracy (reuses validation globals) ──
+import os
+import matplotlib.pyplot as plt
+if "nacc" not in globals() or "eacc" not in globals():
+    print("run the Part XVII validation cell first")
+else:
+    os.makedirs("figures", exist_ok=True)
+    fig, ax = plt.subplots(figsize=(5, 4))
+    bars = ax.bar(["Naive prompt", "Engineered prompt"], [nacc, eacc],
+                  color=["#9aa5b1", "#2563eb"])
+    ax.set_ylim(0, 1); ax.set_ylabel("Accuracy")
+    ax.set_title("Prompt-engineering lift on the labeled holdout")
+    for b in bars:
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.01,
+                f"{b.get_height():.3f}", ha="center", va="bottom")
+    fig.savefig("figures/prompt_lift.png", dpi=150, bbox_inches="tight")
+    plt.show()
+''')
+
+code(r'''
+# ── Viz 2: engineered-prompt accuracy per data quadrant (reuses dfv) ────────
+import os
+import matplotlib.pyplot as plt
+if "dfv" not in globals():
+    print("run the Part XVII validation cell first")
+else:
+    os.makedirs("figures", exist_ok=True)
+    order = ["obf/cyber(0)", "obf/financial(1)", "news/fake(0)", "news/real(1)"]
+    acc = dfv.assign(correct=lambda d: d.p == d.y).groupby("quad").correct.mean()
+    acc = acc.reindex([q for q in order if q in acc.index])
+    fig, ax = plt.subplots(figsize=(6, 4))
+    bars = ax.barh(acc.index, acc.values, color="#2563eb")
+    ax.set_xlim(0, 1); ax.set_xlabel("Accuracy"); ax.invert_yaxis()
+    ax.set_title("Engineered-prompt accuracy by data quadrant")
+    for b in bars:
+        ax.text(b.get_width() + 0.01, b.get_y() + b.get_height() / 2,
+                f"{b.get_width():.3f}", ha="left", va="center")
+    fig.savefig("figures/quadrant_accuracy.png", dpi=150, bbox_inches="tight")
+    plt.show()
+''')
+
+code(r'''
+# ── Predict the 70 test rows with the LLM = THE graded submission ───────
+# Pure GenAI / prompt engineering (FAQ #8): the LLM is the SOLE source of every
+# label. No classical model touches the prediction path.
 print("Classifying 70 test rows with Anthropic /", ANTHROPIC_MODEL, "...")
 llm_pred = classify_many(rt_te["text"].tolist(), system=SYSTEM)
-fails = sum(p == -1 for p in llm_pred)
 
-# Classical predictions: reuse Part XVI's `pred` if present, else fit a quick model.
-if "pred" in globals():
-    classical = np.asarray(pred)
-else:
-    from sklearn.svm import LinearSVC
-    classical = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(rt_tr.text, rt_tr.label).predict(rt_te.text)
-classical = np.asarray(classical).astype(int)
-llm_final = np.array([c if p == -1 else p for p, c in zip(llm_pred, classical)]).astype(int)
+# Pure GenAI: retry any failed calls sequentially (no classical backstop).
+fail_idx = [i for i, p in enumerate(llm_pred) if p == -1]
+if fail_idx:
+    print(f"retrying {len(fail_idx)} failed row(s) sequentially...")
+    for i in fail_idx:
+        llm_pred[i] = classify(rt_te.text[i])
+fails = sum(p == -1 for p in llm_pred)
+unresolved = [int(rt_te.id[i]) for i, p in enumerate(llm_pred) if p == -1]
+if unresolved:
+    print(f"WARNING: {len(unresolved)} row(s) unclassified after retries; defaulting to 0: ids={unresolved}")
+# Last resort for a still-unresolved row is 0 (a default label, NOT a classical prediction).
+llm_final = np.array([0 if p == -1 else p for p in llm_pred]).astype(int)
 
 sample = pd.read_csv("Sample_Submission.csv")
 pd.DataFrame({"id": rt_te["id"].values, "label": llm_final})[list(sample.columns)].to_csv("submission.csv", index=False)
-pd.DataFrame({"id": rt_te["id"].values, "label": classical})[list(sample.columns)].to_csv("submission_classical.csv", index=False)
 
-agree = int((llm_final == classical).sum())
-print(f"LLM call failures (filled from classical): {fails}")
-print(f"LLM vs classical agreement on test: {agree}/70")
-print("submission.csv = LLM (PRIMARY, GenAI) | submission_classical.csv = classical backup (~99.99% CV)")
+print(f"\nWrote submission.csv = {len(llm_final)} LLM predictions (Anthropic Claude, few-shot prompting)")
+print(f"LLM call failures: {fails}")
 print("label counts (LLM):", pd.Series(llm_final).value_counts().to_dict())
-dis = [(int(rt_te.id[i]), int(classical[i]), int(llm_final[i]),
-        ("obf" if rt_te.is_obf[i] else ("news+Reuters" if rt_te.reuters[i] else "news")),
-        trunc(rt_te.text[i], 80)) for i in range(len(rt_te)) if llm_final[i] != classical[i]]
-if dis:
-    print("\ndisagreements (id, classical, llm, type, text):")
-    for d in dis: print("   ", d)
+''')
+
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
+### Diagnostic — classical baseline vs LLM submission (read-only)
+
+**Diagnostic only** — compares the exploratory Part XVI classical baseline (`pred`) against the Part XVII
+LLM submission (`llm_final`); the quickest way to eyeball the id=37 disagreement. **Writes nothing; not part
+of the graded prediction path.**
+''')
+
+code(r'''
+# ── Read-only diagnostic: classical baseline vs LLM submission ──────────
+# Reads ONLY the already-computed `pred` (Part XVI) and `llm_final` (Part XVII).
+# It fits no model and writes no file — purely for inspecting disagreements.
+if "pred" not in globals():
+    print("classical baseline `pred` not found — run Part XVI to populate it, then re-run this cell.")
 else:
-    print("\nno disagreements — the LLM matches the classical model on all 70 rows.")
+    classical = np.asarray(pred).astype(int)
+    agree = int((llm_final == classical).sum())
+    print(f"classical vs LLM agreement: {agree}/{len(llm_final)}")
+    dis = [(int(rt_te.id[i]), int(classical[i]), int(llm_final[i]),
+            ("obf" if rt_te.is_obf[i] else ("news+Reuters" if rt_te.reuters[i] else "news")),
+            trunc(rt_te.text[i], 80)) for i in range(len(rt_te)) if llm_final[i] != classical[i]]
+    if dis:
+        print("\ndisagreements (id, classical, llm, type, text):")
+        for d in dis: print("   ", d)
+    else:
+        print("\nno disagreements — the LLM matches the classical baseline on all 70 rows.")
 ''')
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1477,6 +1655,7 @@ deep-research pass (25 claims verified, 3 refuted). Code runs end-to-end on `MLE
 ''')
 
 # ════════════════════════════════════════════════════════════════════════
+style_headers()          # apply the brand-green header hierarchy before writing
 nb.cells = cells
 nb.metadata["kernelspec"] = {"name": "mlenv311", "display_name": "Python (MLENV311)", "language": "python"}
 nb.metadata["language_info"] = {"name": "python"}
