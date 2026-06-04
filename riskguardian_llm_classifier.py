@@ -3,13 +3,12 @@
 RiskGuardian — GenAI predictor: few-shot LLM classification with Anthropic Claude.
 
 NOTE: PLEASE DISREGARD PRIOR SUBMISSIONS- we were using vanilla ML techniques (TF-IDF + LinearSVC) 
-NOT GENAI as instructed in the FAQ. 
+AND THEN BACKSTOPPING LLM WITH THEM. NOT 100% GENAI as instructed in the FAQ. 
 THIS VERSION implements a few-shot prompting approach with an Anthropic Claude model: 
 
 It few-shot-prompts Claude to label each test row 0 (cybersecurity / fake-news) or
 1 (financial / real-Reuters-news), and writes:
-    submission.csv            <- LLM predictions (PRIMARY, GenAI / FAQ #8)
-    submission_classical.csv  <- TF-IDF + LinearSVC backstop (~99.99% CV); also fills any failed call
+    submission.csv            <- LLM predictions (pure GenAI / FAQ #8; no classical fallback)
 
 The corpus is a *combination*: ~1/3 char-obfuscated synthetic risk events (cyber=0 / financial=1)
 and ~2/3 the ISOT fake/real news set (fake clickbait=0 / real Reuters=1). The engineered prompt
@@ -18,7 +17,7 @@ encodes that structure; few-shot examples span all four quadrants.
 Usage (run with the MLENV311 interpreter):
     python riskguardian_llm_classifier.py                 # validate (40 rows) + classify the 70 test rows
     python riskguardian_llm_classifier.py --no-validate   # skip validation, just classify + submit
-    python riskguardian_llm_classifier.py --dry-run       # no API calls: classical only + show a sample prompt
+    python riskguardian_llm_classifier.py --dry-run       # no API calls: just show a sample prompt
     ANTHROPIC_MIN_INTERVAL=1.0 python riskguardian_llm_classifier.py --workers 6   # tune pacing/concurrency
 
 Requires ANTHROPIC_API_KEY in the environment or in ./config.json.
@@ -30,9 +29,6 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import pandas as pd
 import requests
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.svm import LinearSVC
 
 TRAIN_CSV  = "combined_risk_train.csv"
 TEST_CSV   = "combined_risk_test.csv"
@@ -69,19 +65,6 @@ def load_frames():
         d["is_obf"]  = d["clean"] < 0.55
         d["reuters"] = d["text"].str.contains("Reuters", case=True)
     return tr, te
-
-
-# ── classical backstop: word + char_wb TF-IDF -> LinearSVC (Part XVI) ──────
-def text_features():
-    return FeatureUnion([
-        ("word", TfidfVectorizer(analyzer="word",    ngram_range=(1, 2), min_df=2, sublinear_tf=True, max_features=200_000)),
-        ("char", TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=3, sublinear_tf=True, max_features=300_000)),
-    ])
-
-
-def classical_predict(rt_tr, rt_te):
-    pipe = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(rt_tr.text, rt_tr.label)
-    return np.asarray(pipe.predict(rt_te.text)).astype(int)
 
 
 # ── LLM few-shot classifier (Anthropic Claude) — Part XVII ─────────────────
@@ -162,7 +145,7 @@ def classify(text, api_key, shots, system=SYSTEM, model=ANTHROPIC_MODEL, retries
             time.sleep(delay + random.uniform(0, 0.5))
             delay = min(delay * 2, 30)
     print("  gave up on one row after", retries, "tries")
-    return -1                                                       # caller falls back to classical
+    return -1                                                       # unresolved; main() retries then defaults to 0
 
 
 def classify_many(texts, api_key, shots, system=SYSTEM, workers=4):
@@ -202,7 +185,7 @@ def validate(rt_tr, api_key, shots, shot_idx, rng, workers=4, per_quad=10):
 def main():
     ap = argparse.ArgumentParser(description="Few-shot LLM classifier for the RiskGuardian test set.")
     ap.add_argument("--no-validate", action="store_true", help="skip the labeled-holdout validation pass")
-    ap.add_argument("--dry-run", action="store_true", help="no API calls: classical only + print a sample prompt")
+    ap.add_argument("--dry-run", action="store_true", help="no API calls: just print a sample prompt")
     ap.add_argument("--workers", type=int, default=4, help="concurrent API workers (default 4)")
     args = ap.parse_args()
 
@@ -212,15 +195,9 @@ def main():
     shot_idx, shots, rng = build_shots(rt_tr)
     print(f"few-shot examples: {len(shot_idx)} (2 per quadrant)")
 
-    print("\nFitting classical backstop (TF-IDF + LinearSVC)...")
-    classical = classical_predict(rt_tr, rt_te)
-
     if args.dry_run:
-        print("\n[dry-run] sample prompt that WOULD be sent for test id=0:\n" + "-" * 60)
+        print("\n[dry-run] sample prompt for test id=0 (no API calls):\n" + "-" * 60)
         print("SYSTEM:\n" + SYSTEM + "\n\nUSER:\n" + make_user_prompt(rt_te.text[0], shots)[:1200] + " ...")
-        sample = pd.read_csv(SAMPLE_CSV)
-        pd.DataFrame({"id": rt_te["id"].values, "label": classical})[list(sample.columns)].to_csv("submission_classical.csv", index=False)
-        print("\n[dry-run] wrote submission_classical.csv (no LLM calls made).")
         return
 
     api_key = load_api_key()
@@ -235,27 +212,22 @@ def main():
 
     print(f"\nClassifying {len(rt_te)} test rows with Anthropic / {ANTHROPIC_MODEL} ...")
     llm_pred = classify_many(rt_te["text"].tolist(), api_key, shots, system=SYSTEM, workers=args.workers)
-    fails = sum(p == -1 for p in llm_pred)
-    llm_final = np.array([c if p == -1 else p for p, c in zip(llm_pred, classical)]).astype(int)
+
+    # Pure GenAI: retry any failed calls sequentially (no classical backstop).
+    fail_idx = [i for i, p in enumerate(llm_pred) if p == -1]
+    if fail_idx:
+        print(f"retrying {len(fail_idx)} failed row(s) sequentially...")
+        for i in fail_idx:
+            llm_pred[i] = classify(rt_te.text[i], api_key, shots)
+    unresolved = [int(rt_te.id[i]) for i, p in enumerate(llm_pred) if p == -1]
+    if unresolved:
+        print(f"WARNING: {len(unresolved)} row(s) unclassified after retries; defaulting to 0: ids={unresolved}")
+    llm_final = np.array([0 if p == -1 else p for p in llm_pred]).astype(int)
 
     sample = pd.read_csv(SAMPLE_CSV)
     pd.DataFrame({"id": rt_te["id"].values, "label": llm_final})[list(sample.columns)].to_csv("submission.csv", index=False)
-    pd.DataFrame({"id": rt_te["id"].values, "label": classical})[list(sample.columns)].to_csv("submission_classical.csv", index=False)
-
-    agree = int((llm_final == classical).sum())
-    print(f"\nLLM call failures (filled from classical): {fails}")
-    print(f"LLM vs classical agreement on test: {agree}/{len(rt_te)}")
-    print("submission.csv = LLM (PRIMARY, GenAI) | submission_classical.csv = classical backup (~99.99% CV)")
-    print("label counts (LLM):", pd.Series(llm_final).value_counts().to_dict())
-    dis = [(int(rt_te.id[i]), int(classical[i]), int(llm_final[i]),
-            ("obf" if rt_te.is_obf[i] else ("news+Reuters" if rt_te.reuters[i] else "news")),
-            trunc(rt_te.text[i], 80)) for i in range(len(rt_te)) if llm_final[i] != classical[i]]
-    if dis:
-        print("\ndisagreements (id, classical, llm, type, text):")
-        for d in dis:
-            print("   ", d)
-    else:
-        print("\nno disagreements — the LLM matches the classical model on all rows.")
+    print(f"\nWrote submission.csv = {len(llm_final)} LLM predictions (Anthropic Claude, few-shot prompting)")
+    print("label counts:", pd.Series(llm_final).value_counts().to_dict())
 
 
 if __name__ == "__main__":
