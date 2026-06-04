@@ -1281,6 +1281,183 @@ display(top_table(order[:12]))
 
 # ════════════════════════════════════════════════════════════════════════
 md(r'''
+## Part XVII — GenAI predictor: few-shot LLM classification (Anthropic Claude)
+
+The brief asks for predictions via **prompt engineering with a pre-trained LLM** (FAQ #8). Parts XIV–XVI
+use a classical TF-IDF → SVM model — excellent accuracy, but *not* GenAI. This part makes the **LLM the
+primary predictor**: it few-shot-prompts **Anthropic Claude** to label all 70 test rows and writes that as
+`submission.csv`. The classical model is retained as a **confidence backstop** (`submission_classical.csv`)
+and to fill in any failed API call.
+
+**Why prompt engineering is non-trivial here.** The true label rule for the ~2/3 *news* portion is
+**fake-vs-real**, not "cyber vs financial" — unknowable from the brief alone. So the engineered prompt
+encodes the structure we discovered (two text types; for news, neutral newswire / Reuters = 1 vs
+sensational clickbait = 0) and supplies **few-shot examples spanning all four quadrants** (obfuscated
+cyber/financial + clean fake/real). The validation cell quantifies the **lift over a naive prompt**.
+
+> **Honesty (it's a risk product):** an LLM here typically **trails** the linear model's ~99.99%. Because
+> submissions are unlimited (FAQ #5), `submission.csv` is the GenAI-compliant entry and
+> `submission_classical.csv` is the max-accuracy entry — submit whichever the rules reward.
+''')
+
+code(r'''
+# ── GenAI predictor (Anthropic Claude): few-shot prompt classifier ──────
+# Forces Anthropic (the Part XI helper otherwise prefers Cerebras). Predictions
+# from this part become the PRIMARY submission (LLM prompt-engineering, FAQ #8).
+import os, re, json, time, requests
+import numpy as np, pandas as pd
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+API_KEY = os.environ.get("ANTHROPIC_API_KEY") or json.load(open("config.json")).get("ANTHROPIC_API_KEY")
+assert API_KEY, "ANTHROPIC_API_KEY not found (env or config.json)"
+
+def _ensure_frames():                       # reuse Part XVI frames if present, else load + tag
+    g = globals()
+    if "rt_tr" in g and "is_obf" in g["rt_tr"]:
+        return g["rt_tr"], g["rt_te"]
+    tr = pd.read_csv("combined_risk_train.csv"); te = pd.read_csv("combined_risk_test.csv")
+    wl = None
+    for p in ("/usr/share/dict/words", "/usr/dict/words"):
+        if Path(p).exists():
+            wl = set(w.strip().lower() for w in open(p) if len(w.strip()) >= 4); break
+    def clean(t):
+        if wl is None: return 0.5
+        tk = re.findall(r"[A-Za-z]{4,}", t.lower()); return sum(w in wl for w in tk)/len(tk) if tk else 0.0
+    for d in (tr, te):
+        d["clean"] = d["text"].map(clean); d["is_obf"] = d["clean"] < 0.55
+        d["reuters"] = d["text"].str.contains("Reuters", case=True)
+    return tr, te
+rt_tr, rt_te = _ensure_frames()
+
+SYSTEM = (
+  "You classify RiskGuardian items as 0 or 1. The corpus mixes two text types:\n"
+  "(A) Risk reports (words may be scrambled/typo'd): 0 = CYBERSECURITY risk "
+  "(hacking, malware, breaches, networks, intrusion, DDoS, cloud, ransomware); "
+  "1 = FINANCIAL risk (markets, portfolios, debt, liquidity, credit, financial regulation/compliance).\n"
+  "(B) News articles (clean English): 0 = sensational/opinion clickbait (ALL-CAPS hooks, 'WATCH:', "
+  "'Featured image via Getty Images'); 1 = neutral newswire reporting (e.g. Reuters; datelines like "
+  "'WASHINGTON (Reuters) -'; sober 'X said' attribution).\n"
+  "Reply with ONLY one character: 0 or 1."
+)
+SYSTEM_NAIVE = ("Classify the risk event as 0 = Cybersecurity or 1 = Financial. "
+                "Reply with ONLY one character: 0 or 1.")
+
+rng = np.random.default_rng(7)
+def pick(mask, n):
+    idx = np.asarray(rt_tr.index[np.asarray(mask)])
+    return list(rng.choice(idx, size=min(n, len(idx)), replace=False)) if len(idx) else []
+SHOT_IDX = (pick((rt_tr.is_obf) & (rt_tr.label == 0), 2) +
+            pick((rt_tr.is_obf) & (rt_tr.label == 1), 2) +
+            pick((~rt_tr.is_obf) & (rt_tr.label == 0) & (~rt_tr.reuters), 2) +
+            pick((~rt_tr.is_obf) & (rt_tr.label == 1) & (rt_tr.reuters), 2))
+def trunc(t, n): return " ".join(str(t).split())[:n]
+SHOTS = "\n\n".join(f"TEXT: {trunc(rt_tr.text[i], 300)}\nLABEL: {int(rt_tr.label[i])}" for i in SHOT_IDX)
+
+import threading, random
+_rl_lock = threading.Lock(); _rl_last = [0.0]
+MIN_INTERVAL = float(os.environ.get("ANTHROPIC_MIN_INTERVAL", "1.5"))   # global pace ~40 req/min
+def _throttle():                                # serialize request starts across all worker threads
+    with _rl_lock:
+        wait = _rl_last[0] + MIN_INTERVAL - time.time()
+        if wait > 0: time.sleep(wait)
+        _rl_last[0] = time.time()
+
+def classify(text, system=SYSTEM, shots=SHOTS, model=ANTHROPIC_MODEL, retries=8):
+    user = (shots + "\n\n" if shots else "") + f"TEXT: {trunc(text, 1500)}\nLABEL:"
+    payload = {"model": model, "max_tokens": 5, "temperature": 0, "system": system,
+               "messages": [{"role": "user", "content": user}]}
+    delay = 2.0
+    for a in range(retries):
+        try:
+            _throttle()
+            r = requests.post("https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                json=payload, timeout=60)
+            if r.status_code == 200:
+                m = re.search(r"[01]", r.json()["content"][0]["text"]); return int(m.group()) if m else -1
+            if r.status_code in (429, 500, 502, 503, 529):                 # rate-limited / transient -> back off
+                ra = r.headers.get("retry-after")
+                wait = float(ra) if (ra and ra.replace(".", "", 1).isdigit()) else delay
+                time.sleep(min(wait, 30) + random.uniform(0, 0.5)); delay = min(delay * 2, 30); continue
+            r.raise_for_status()
+        except requests.RequestException:
+            time.sleep(delay + random.uniform(0, 0.5)); delay = min(delay * 2, 30)
+    print("  gave up on one row after", retries, "tries"); return -1   # caller falls back to classical
+
+def classify_many(texts, system=SYSTEM, workers=4):
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(lambda t: classify(t, system=system), texts))
+
+print("LLM provider: Anthropic /", ANTHROPIC_MODEL, "| few-shot examples:", len(SHOT_IDX))
+print("smoke test (expect 1):", classify("Quarterly portfolio drawdown and liquidity stress across credit positions."))
+''')
+
+code(r'''
+# ── Validate the prompt on a labeled holdout (honest accuracy estimate) ──
+QUADS = [((rt_tr.is_obf) & (rt_tr.label == 0), "obf/cyber(0)"),
+         ((rt_tr.is_obf) & (rt_tr.label == 1), "obf/financial(1)"),
+         ((~rt_tr.is_obf) & (rt_tr.label == 0), "news/fake(0)"),
+         ((~rt_tr.is_obf) & (rt_tr.label == 1), "news/real(1)")]
+shot = set(int(i) for i in SHOT_IDX)
+val = []
+for m, name in QUADS:
+    pool = [int(i) for i in np.asarray(rt_tr.index[np.asarray(m)]) if int(i) not in shot]
+    val += [(int(i), name) for i in rng.choice(pool, size=min(10, len(pool)), replace=False)]
+vt = [rt_tr.text[i] for i, _ in val]; vy = [int(rt_tr.label[i]) for i, _ in val]
+
+print(f"Validating engineered prompt on {len(val)} held-out labeled rows...")
+vp = classify_many(vt, system=SYSTEM)
+ok = [p == y for p, y in zip(vp, vy) if p != -1]
+print(f"  engineered-prompt accuracy: {np.mean(ok):.3f}   (call failures: {sum(p == -1 for p in vp)})")
+dfv = pd.DataFrame({"quad": [q for _, q in val], "y": vy, "p": vp})
+print(dfv.assign(correct=lambda d: d.p == d.y).groupby("quad").correct.mean().round(3).to_string())
+
+# Naive prompt on a 40-row subset -> shows the prompt-engineering lift.
+sub_i = list(range(0, len(val), 2))[:40]
+npv = classify_many([vt[i] for i in sub_i], system=SYSTEM_NAIVE)
+nacc = np.mean([npv[k] == vy[sub_i[k]] for k in range(len(sub_i)) if npv[k] != -1])
+eacc = np.mean([vp[sub_i[k]] == vy[sub_i[k]] for k in range(len(sub_i)) if vp[sub_i[k]] != -1])
+print(f"\nprompt-engineering lift on the same {len(sub_i)} rows ->  naive: {nacc:.3f}   engineered: {eacc:.3f}")
+''')
+
+code(r'''
+# ── Predict the 70 test rows with the LLM = PRIMARY submission ──────────
+print("Classifying 70 test rows with Anthropic /", ANTHROPIC_MODEL, "...")
+llm_pred = classify_many(rt_te["text"].tolist(), system=SYSTEM)
+fails = sum(p == -1 for p in llm_pred)
+
+# Classical predictions: reuse Part XVI's `pred` if present, else fit a quick model.
+if "pred" in globals():
+    classical = np.asarray(pred)
+else:
+    from sklearn.svm import LinearSVC
+    classical = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(rt_tr.text, rt_tr.label).predict(rt_te.text)
+classical = np.asarray(classical).astype(int)
+llm_final = np.array([c if p == -1 else p for p, c in zip(llm_pred, classical)]).astype(int)
+
+sample = pd.read_csv("Sample_Submission.csv")
+pd.DataFrame({"id": rt_te["id"].values, "label": llm_final})[list(sample.columns)].to_csv("submission.csv", index=False)
+pd.DataFrame({"id": rt_te["id"].values, "label": classical})[list(sample.columns)].to_csv("submission_classical.csv", index=False)
+
+agree = int((llm_final == classical).sum())
+print(f"LLM call failures (filled from classical): {fails}")
+print(f"LLM vs classical agreement on test: {agree}/70")
+print("submission.csv = LLM (PRIMARY, GenAI) | submission_classical.csv = classical backup (~99.99% CV)")
+print("label counts (LLM):", pd.Series(llm_final).value_counts().to_dict())
+dis = [(int(rt_te.id[i]), int(classical[i]), int(llm_final[i]),
+        ("obf" if rt_te.is_obf[i] else ("news+Reuters" if rt_te.reuters[i] else "news")),
+        trunc(rt_te.text[i], 80)) for i in range(len(rt_te)) if llm_final[i] != classical[i]]
+if dis:
+    print("\ndisagreements (id, classical, llm, type, text):")
+    for d in dis: print("   ", d)
+else:
+    print("\nno disagreements — the LLM matches the classical model on all 70 rows.")
+''')
+
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
 ## References
 
 1. **FIRST.org — EPSS FAQ / Model.** EPSS uses a binomial **XGBoost** estimator (v4, Mar 2025); EPSS is a measure of *threat*, to be combined with CVSS. https://www.first.org/epss/faq
