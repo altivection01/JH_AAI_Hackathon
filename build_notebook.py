@@ -1227,6 +1227,60 @@ display(sub.head(8))
 
 # ════════════════════════════════════════════════════════════════════════
 md(r'''
+### How it works — TF-IDF features → LinearSVC, and what it learned
+
+The classifier is two stages: **TF-IDF** turns each document into a long *sparse* vector of numbers, and
+**LinearSVC** learns one weight per number and classifies by their weighted sum.
+
+**TF-IDF (vectorization).** Each "term" gets a score per document = **TF × IDF**:
+- **TF — term frequency:** how often the term occurs in *this* doc. With `sublinear_tf=True` it is `1 + ln(tf)`, so repeats give diminishing returns (one word repeated 50× can't dominate).
+- **IDF — inverse document frequency:** how *rare* the term is across the corpus, so ubiquitous terms ("the") are damped and distinctive ones amplified. sklearn's default is `idf(t) = ln[(1 + N) / (1 + df(t))] + 1` (N = #docs, df = #docs containing the term).
+- Each document vector is then **L2-normalized** so long and short texts compare fairly.
+
+We union **two** vectorizers side by side (≈500k features total):
+- `analyzer="word", (1,2)` — whole words and word-pairs → topical signal (`reuters`, `president donald`, `getty images`).
+- `analyzer="char_wb", (3,5)` — 3–5 character chunks inside word boundaries → **robust to the obfuscation**: even when per-character scrambling breaks a whole word, fragments like `reut` / `euter` / `uters` survive, so the signal is not lost. This is why the model holds up on the corrupted synthetic half.
+
+`min_df` drops ultra-rare terms (typos/noise), `max_features` caps the vocabulary for speed/memory.
+
+**LinearSVC (the boundary).** Every doc is now a point in ~500k-dim space. The SVM learns a weight vector
+`w` and bias `b` and predicts `label = 1 if (w·x + b) > 0 else 0`. Among all boundaries that separate the
+classes it picks the **maximum-margin** one — the widest gap to the nearest documents (the "support
+vectors") — trading fit against simplicity via the penalty `½‖w‖²` and the dial `C` (=1.0; larger C = fit
+harder). Linear models are a famously strong, fast baseline on high-dimensional **sparse** text where the
+classes are nearly linearly separable — exactly this corpus, hence the ~99.99% CV. (We fit `LogisticRegression`
+separately only for *probabilities* in the confidence check; LinearSVC outputs a score, not a probability.)
+
+The cell below reads the learned weights straight off the fitted model — the most positive / most negative
+features are literally *what the model keys on* for each class.
+''')
+
+code(r'''
+# ── Interpretability: the features LinearSVC weights most for each class ──
+# Reuses the `svc` pipeline fitted two cells above (binary => a single weight vector).
+names = svc.named_steps["feats"].get_feature_names_out()
+w     = svc.named_steps["clf"].coef_[0]          # weight per feature; >0 pushes toward label 1
+order = np.argsort(w)
+
+def top_table(idxs):
+    return pd.DataFrame({
+        "feature": [names[i].split("__", 1)[1] for i in idxs],
+        "kind":    [names[i].split("__", 1)[0] for i in idxs],   # 'word' or 'char'
+        "weight":  [round(float(w[i]), 3) for i in idxs],
+    })
+
+n_word = sum(n.startswith("word__") for n in names)
+print(f"{len(names):,} features ({n_word:,} word + {len(names)-n_word:,} char)"
+      f" | bias b = {float(svc.named_steps['clf'].intercept_[0]):.3f}"
+      f" | decision: label 1 if (w·x + b) > 0\n")
+print(">>> Top features pushing toward label 1 (financial / real-Reuters news):")
+display(top_table(order[::-1][:12]))
+print(">>> Top features pushing toward label 0 (cyber / fake-news clickbait):")
+display(top_table(order[:12]))
+''')
+
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
 ## References
 
 1. **FIRST.org — EPSS FAQ / Model.** EPSS uses a binomial **XGBoost** estimator (v4, Mar 2025); EPSS is a measure of *threat*, to be combined with CVSS. https://www.first.org/epss/faq
