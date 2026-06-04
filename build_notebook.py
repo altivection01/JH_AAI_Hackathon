@@ -1019,17 +1019,20 @@ row per test record** (FAQ #1–#2). The cell below **generates and validates** 
 upload **this notebook** as the solution file (FAQ #2 note). Submissions are **unlimited** (FAQ #5); the
 work must be **original** — plagiarism means disqualification.
 
-> ⚠️ When the dataset is released, set `ID_COL` / `TARGET_COL` to match `Sample_Submission.csv` **exactly**
-> (case-sensitive) and pass the real test frame + its id column to `make_submission`.
+> ✅ **The dataset has been released.** The released task is **binary text classification**, not the
+> synthetic tabular `risk_class` modeled above — so the **authoritative leaderboard submission is produced
+> in Part XVI** (below) from the real `combined_risk_*.csv` files. The cell here is kept only as a
+> **format/validation demo** on the synthetic split and writes to `submission_synthetic_demo.csv` so it
+> never collides with the real `submission.csv`.
 ''')
 
 code(r'''
-# ── Generate the leaderboard submission CSV (FAQ #1, #2) ────────────────
-# TODO when the dataset drops: match Sample_Submission.csv EXACTLY (case-sensitive).
+# ── Format/validation DEMO on the synthetic split (real submission is in Part XVI) ──
+# Writes submission_synthetic_demo.csv so it never collides with the real submission.csv.
 ID_COL, TARGET_COL = "Id", "risk_class"
 
 def make_submission(model, X_test, ids, id_col=ID_COL, target_col=TARGET_COL,
-                    path="submission.csv", label_encoder=None, as_label=True):
+                    path="submission_synthetic_demo.csv", label_encoder=None, as_label=True):
     preds = model.predict(X_test)
     if label_encoder is not None and as_label:
         preds = label_encoder.inverse_transform(preds)     # int codes -> original labels
@@ -1037,8 +1040,8 @@ def make_submission(model, X_test, ids, id_col=ID_COL, target_col=TARGET_COL,
     sub.to_csv(path, index=False)
     return sub
 
-submission = make_submission(clf, Xte, np.arange(1, len(Xte)+1), label_encoder=le)   # demo on test split
-print("Wrote submission.csv", submission.shape)
+submission = make_submission(clf, Xte, np.arange(1, len(Xte)+1), label_encoder=le)   # demo on synthetic split
+print("Wrote submission_synthetic_demo.csv", submission.shape)
 display(submission.head())
 ''')
 
@@ -1056,7 +1059,7 @@ def validate_submission(path, expected_cols, expected_rows):
     for k, v in checks.items(): print("PASS" if v else "FAIL", "-", k)
     return all(checks.values())
 
-print("\nSUBMISSION VALID:", validate_submission("submission.csv", [ID_COL, TARGET_COL], len(Xte)))
+print("\nDEMO SUBMISSION VALID:", validate_submission("submission_synthetic_demo.csv", [ID_COL, TARGET_COL], len(Xte)))
 ''')
 
 # ════════════════════════════════════════════════════════════════════════
@@ -1090,6 +1093,140 @@ scoring), *Detect* (anomaly detection), *Respond* (chaining-prioritized backlog,
 
 # ════════════════════════════════════════════════════════════════════════
 md(r'''
+## Part XVI — Real dataset: text classification & leaderboard submission
+
+The released task is **binary text classification** on `combined_risk_train.csv` /
+`combined_risk_test.csv` (columns `id, text, label`), scored on **Accuracy** (FAQ #3). This is a
+*different* problem from the synthetic tabular `risk_class` modeled in Parts III–XII, so it gets its own
+**leaderboard accuracy engine** here; the GBDT/ensemble above remains the showcase for the projection
+methodology.
+
+**What the released corpus actually is — a *combination* of two sources** (worth knowing, because it
+drives the feature choice):
+
+| Sub-corpus | ~Share of train | Form | Label 0 | Label 1 |
+|---|---|---|---|---|
+| Synthetic risk events | ~1/3 | **character-obfuscated** text (e.g. *"CybernseRuirty"*, *"financal rtanactions"*) | Cybersecurity | Financial |
+| ISOT Fake/Real news | ~2/3 | clean English articles | Fake clickbait | Real (Reuters) |
+
+So label **0 = cyber *or* fake-news**, label **1 = financial *or* real-Reuters-news**, and the test set is
+the same mix. The model therefore unions **word n-grams** (topical signal on the clean docs) with
+**character `char_wb` n-grams (3–5)** — the latter stay informative even when the per-character scrambling
+destroys whole-word tokens. A linear **SVM** on those features cross-validates at **~99.99%** accuracy and
+is strong on *both* sub-corpora independently (shown below), so the headline number isn't hiding a weak half.
+''')
+
+code(r'''
+# ── Real released dataset: load + reveal the combined structure ─────────
+import re
+from pathlib import Path
+
+rt_tr = pd.read_csv("combined_risk_train.csv")
+rt_te = pd.read_csv("combined_risk_test.csv")
+print("train:", rt_tr.shape, "| test:", rt_te.shape, "| cols:", list(rt_tr.columns))
+print("label balance:", rt_tr["label"].value_counts().to_dict(), "(0=Cyber/Fake, 1=Financial/Real)")
+
+# A dictionary-hit ratio cleanly separates the two sub-corpora:
+#   low  ratio -> char-OBFUSCATED synthetic risk events (cyber=0 / financial=1)
+#   high ratio -> CLEAN ISOT news (fake clickbait=0 / real Reuters=1)
+def _load_dict():
+    for p in ("/usr/share/dict/words", "/usr/dict/words"):
+        if Path(p).exists():
+            return set(w.strip().lower() for w in open(p) if len(w.strip()) >= 4)
+    return None
+DICT = _load_dict()
+
+def cleanliness(t):
+    if DICT is None: return np.nan
+    toks = re.findall(r"[A-Za-z]{4,}", t.lower())
+    return sum(w in DICT for w in toks) / len(toks) if toks else 0.0
+
+if DICT is not None:
+    for d in (rt_tr, rt_te):
+        d["clean"]   = d["text"].map(cleanliness)
+        d["is_obf"]  = d["clean"] < 0.55
+        d["reuters"] = d["text"].str.contains("Reuters", case=True)
+    print(f"\ntrain composition: obfuscated {rt_tr.is_obf.mean():.0%} | clean {(~rt_tr.is_obf).mean():.0%}")
+    print(f"test  composition: obfuscated {int(rt_te.is_obf.sum())} | clean {int((~rt_te.is_obf).sum())} of {len(rt_te)}")
+    cl = rt_tr[~rt_tr.is_obf]
+    print("\namong CLEAN train docs, 'Reuters' presence vs label (0=fake / 1=real):")
+    print(pd.crosstab(cl.reuters, cl.label))
+else:
+    print("\n(no system word list found - skipping the obf/clean breakdown; the model is unaffected.)")
+''')
+
+code(r'''
+# ── Leaderboard accuracy engine: word + char_wb TF-IDF -> LinearSVC ─────
+# char_wb n-grams are the key: they remain informative under the per-character
+# obfuscation that breaks whole-word tokens; word n-grams add topical signal.
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import FeatureUnion
+from sklearn.svm import LinearSVC
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import StratifiedKFold
+
+def text_features():
+    return FeatureUnion([
+        ("word", TfidfVectorizer(analyzer="word",    ngram_range=(1, 2), min_df=2, sublinear_tf=True, max_features=200_000)),
+        ("char", TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), min_df=3, sublinear_tf=True, max_features=300_000)),
+    ])
+
+Xr = rt_tr["text"].values
+yr = rt_tr["label"].values
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# Single CV pass; report overall accuracy and (when available) per-source accuracy.
+is_obf = rt_tr["is_obf"].values if "is_obf" in rt_tr else np.zeros(len(Xr), bool)
+acc, acc_obf, acc_cln = [], [], []
+for tr_i, va_i in cv.split(Xr, yr):
+    m = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(Xr[tr_i], yr[tr_i])
+    p, yv = m.predict(Xr[va_i]), yr[va_i]
+    acc.append((p == yv).mean())
+    mo = is_obf[va_i]
+    if mo.any():    acc_obf.append((p[mo]  == yv[mo]).mean())
+    if (~mo).any(): acc_cln.append((p[~mo] == yv[~mo]).mean())
+print(f"5-fold CV accuracy (LEADERBOARD METRIC, FAQ #3): {np.mean(acc):.4f}  +/- {np.std(acc):.4f}")
+if acc_obf: print(f"  - obfuscated synthetic subset: {np.mean(acc_obf):.4f}")
+if acc_cln: print(f"  - clean ISOT-news subset:      {np.mean(acc_cln):.4f}")
+''')
+
+code(r'''
+# ── Fit on ALL train, predict the 70 test rows, write & validate submission ──
+Xr_test = rt_te["text"].values
+svc  = Pipeline([("feats", text_features()), ("clf", LinearSVC(C=1.0))]).fit(Xr, yr)
+pred = svc.predict(Xr_test).astype(int)
+
+# Confidence triple-check (none of these alter `pred`):
+lr = Pipeline([("feats", text_features()), ("clf", LogisticRegression(max_iter=2000, C=10))]).fit(Xr, yr)
+agree_lr = int((lr.predict(Xr_test) == pred).sum())
+agree_struct = None
+if "is_obf" in rt_te:                          # structural rule: clean -> Reuters?1:0 ; obfuscated -> trust model
+    struct = np.where(~rt_te.is_obf.values, rt_te.reuters.values.astype(int), pred)
+    agree_struct = int((struct == pred).sum())
+print(f"confidence cross-checks  ->  LinearSVC vs LogReg: {agree_lr}/70" +
+      (f"   |  SVC vs structural rule: {agree_struct}/70" if agree_struct is not None else ""))
+
+# Build submission to match Sample_Submission.csv EXACTLY (FAQ #1, #2).
+sample = pd.read_csv("Sample_Submission.csv")
+sub = pd.DataFrame({"id": rt_te["id"].values, "label": pred})[list(sample.columns)]
+sub.to_csv("submission.csv", index=False)
+
+checks = {
+    "exactly 2 columns":                  sub.shape[1] == 2,
+    f"columns == {list(sample.columns)}": list(sub.columns) == list(sample.columns),
+    "row count == 70":                    len(sub) == 70,
+    "ids match test set (and order)":     list(sub["id"]) == list(rt_te["id"]),
+    "labels in {0,1}":                    set(int(v) for v in sub["label"].unique()) <= {0, 1},
+    "no missing predictions":             bool(sub.notna().all().all()),
+}
+for k, v in checks.items(): print("PASS" if v else "FAIL", "-", k)
+print("\nSUBMISSION VALID:", all(checks.values()),
+      "| label counts:", sub["label"].value_counts().to_dict())
+display(sub.head(8))
+''')
+
+# ════════════════════════════════════════════════════════════════════════
+md(r'''
 ## References
 
 1. **FIRST.org — EPSS FAQ / Model.** EPSS uses a binomial **XGBoost** estimator (v4, Mar 2025); EPSS is a measure of *threat*, to be combined with CVSS. https://www.first.org/epss/faq
@@ -1113,7 +1250,8 @@ nb.cells = cells
 nb.metadata["kernelspec"] = {"name": "mlenv311", "display_name": "Python (MLENV311)", "language": "python"}
 nb.metadata["language_info"] = {"name": "python"}
 
-OUT = "/Users/scollins/workspace/hackathon/RiskGuardian_Cyber_Risk_Assessment.ipynb"
+import os
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "RiskGuardian_Cyber_Risk_Assessment.ipynb")
 with open(OUT, "w") as f:
     nbf.write(nb, f)
 print(f"Wrote {OUT}")
