@@ -345,9 +345,17 @@ for c in cells:
         continue
     s = "".join(c["source"])
     s = _swap_alpha_logo(s)
+    s = s.replace("## Problem Statement",
+                  '## <span style="color:#40634A">Problem Statement</span>')
     s = _reflow(s)
     s = _green_numbers(s)
     c["source"] = s.splitlines(keepends=True)
+
+# ───────────────────────── footer: left-aligned white-bg logo + rule ─────────
+cells.append(md('<div align="left"><img src="data:image/png;base64,' + _white_b64 +
+                '" alt="the_plotly_thickens — RiskGuardian (JHU AAI Hackathon)" '
+                'width="300" /></div>'))
+cells.append(md("---"))
 
 # ───────────────────────── assemble + write ─────────────────────────────────
 nb = {

@@ -1802,6 +1802,13 @@ for _i, _c in enumerate(cells):
         cells[_i+1:_i+1] = [_md, _cd]
         break
 
+# ── footer: left-aligned white-bg logo + rule ──
+_FOOTER_LOGO = ('<div align="left"><img src="data:image/png;base64,' + _white_b64 +
+                '" alt="the_plotly_thickens — RiskGuardian (JHU AAI Hackathon)" '
+                'width="300" /></div>')
+cells.append(nbf.v4.new_markdown_cell(_FOOTER_LOGO))
+cells.append(nbf.v4.new_markdown_cell("---"))
+
 nb.cells = cells
 nb.metadata["kernelspec"] = {"name": "mlenv311", "display_name": "Python (MLENV311)", "language": "python"}
 nb.metadata["language_info"] = {"name": "python"}
