@@ -1,38 +1,42 @@
 #!/usr/bin/env python
 """
-build_submission2_notebook.py — assemble submission2.ipynb (ROAD), HF-local edition.
+build_submission2_notebook.py — assemble submission2.ipynb (ROAD), Apple-silicon / MLX edition.
 
-A structural duplicate of submission.ipynb that swaps the three *API* few-shot
-classifiers (Anthropic / Cerebras / OpenAI) for three *local Hugging Face*
-few-shot classifiers, runnable on a 128 GB machine via 4-bit quantization:
+A structural twin of submission.ipynb that runs the SAME engineered few-shot prompt entirely
+LOCAL on Apple silicon via MLX (mlx-lm). The models are 4-bit MLX conversions hosted on the
+Hugging Face Hub (mlx-community), so they load straight from HF and run on the Mac's unified
+memory / Metal GPU — no CUDA, no bitsandbytes. Output -> submission2.csv.
 
-    mistralai/Mixtral-8x22B-Instruct-v0.1   (141B MoE, ~80 GB @ 4-bit)  -- largest
-    Qwen/Qwen2.5-72B-Instruct               (72B,      ~42 GB @ 4-bit)
-    meta-llama/Llama-3.3-70B-Instruct       (70B,      ~40 GB @ 4-bit)
+Three largest open instruct models that fit a 128 GB Mac at 4-bit:
+    mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit   (141B MoE, ~78 GB)  -- largest
+    mlx-community/Qwen2.5-72B-Instruct-4bit          (72B,      ~40 GB)
+    mlx-community/Llama-3.3-70B-Instruct-4bit         (70B,      ~40 GB)
 
-The same engineered few-shot prompt is used. Output -> submission2.csv.
-Reuses the banner art + the Requirements / prompt-engineering / viz blocks from
-submission.ipynb; writes the three HF scripts to disk and inlines them.
+Shared cells (art, data-reveal, prompt-story, validation, viz) are reused verbatim from the
+existing submission2.ipynb so this stays decoupled from submission.ipynb's evolving structure.
 """
 import json
 from pathlib import Path
 
-SRC_NB = "submission.ipynb"          # reuse art + shared analysis cells from here
+SRC_NB = "submission2.ipynb"     # reuse the stable shared cells from the current notebook
 OUT_NB = "submission2.ipynb"
+OLD_SCRIPTS = ["riskguardian_hf_mixtral_classifier.py",
+               "riskguardian_hf_qwen_classifier.py",
+               "riskguardian_hf_llama_classifier.py"]
 
-# (filename, model id, slug, total-params blurb, 4-bit mem, one-line desc)
+# (filename, model id, slug, params blurb, 4-bit mem, one-line desc)
 MODELS = [
-    ("riskguardian_hf_mixtral_classifier.py", "mistralai/Mixtral-8x22B-Instruct-v0.1",
-     "mixtral-8x22b", "141B sparse-MoE (≈39B active)", "≈80 GB",
-     "Mixtral-8x22B — the LARGEST by total parameters; a sparse MoE, so inference is fast for its size."),
-    ("riskguardian_hf_qwen_classifier.py", "Qwen/Qwen2.5-72B-Instruct",
-     "qwen2.5-72b", "72B dense", "≈42 GB",
+    ("riskguardian_mlx_mixtral_classifier.py", "mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit",
+     "mixtral-8x22b", "141B sparse-MoE (≈39B active)", "≈78 GB",
+     "Mixtral-8x22B — the LARGEST by total parameters; a sparse MoE, so decode is fast for its size."),
+    ("riskguardian_mlx_qwen_classifier.py", "mlx-community/Qwen2.5-72B-Instruct-4bit",
+     "qwen2.5-72b", "72B dense", "≈40 GB",
      "Qwen2.5-72B-Instruct — a very strong dense instruct model; excellent at constrained classification."),
-    ("riskguardian_hf_llama_classifier.py", "meta-llama/Llama-3.3-70B-Instruct",
+    ("riskguardian_mlx_llama_classifier.py", "mlx-community/Llama-3.3-70B-Instruct-4bit",
      "llama-3.3-70b", "70B dense", "≈40 GB",
-     "Llama-3.3-70B-Instruct — Meta's strongest 70B instruct model; comfortable headroom on 128 GB."),
+     "Llama-3.3-70B-Instruct — Meta's strongest 70B instruct model; comfortable headroom on a 128 GB Mac."),
 ]
-PRIMARY_MODEL = "Qwen/Qwen2.5-72B-Instruct"   # default for submission2.csv (override via HF_MODEL)
+PRIMARY_MODEL = "mlx-community/Qwen2.5-72B-Instruct-4bit"   # default -> submission2.csv (override via HF_MODEL)
 
 # ───────────────────────── shared prompt/data fragments ─────────────────────
 SYSTEM = (
@@ -82,30 +86,31 @@ def build_shots(rt_tr, seed=7):
     shots = "\\n\\n".join(f"TEXT: {trunc(rt_tr.text[i], 300)}\\nLABEL: {int(rt_tr.label[i])}" for i in shot_idx)
     return shot_idx, shots, rng'''
 
-# ───────────────────────── HF standalone-script template ────────────────────
-HF_SCRIPT = '''#!/usr/bin/env python
+# ───────────────────────── MLX standalone-script template ───────────────────
+MLX_SCRIPT = '''#!/usr/bin/env python
 """
-RiskGuardian — GenAI predictor: few-shot classification with a LOCAL Hugging Face model.
+RiskGuardian — GenAI predictor: few-shot classification on Apple silicon via MLX.
 
 __DESC__
 
-Runs the SAME engineered few-shot prompt as the API classifiers, but entirely LOCAL via
-`transformers` with 4-bit (nf4) quantization, so the model fits in 128 GB. The label is
-decided by comparing the next-token logits of "0" vs "1" — deterministic, and it never fails.
+Runs the SAME engineered few-shot prompt as the API classifiers, fully LOCAL on Apple silicon
+via MLX (mlx-lm). The model is a 4-bit MLX conversion on the Hugging Face Hub (mlx-community),
+so it loads straight from HF and runs on the Mac's unified memory / Metal GPU — no CUDA, no
+bitsandbytes. The label is decided by comparing the next-token logits of "0" vs "1":
+deterministic, a single forward pass, and it never emits an unparseable answer.
 Writes:
     __OUT__   <- predictions (pure GenAI / FAQ #8; no classical fallback)
 
-Model: __MODEL_ID__   (__PARAMS__, __MEM__ at 4-bit nf4)
+Model: __MODEL_ID__   (__PARAMS__, __MEM__ at 4-bit)
 
-Requires (MLENV311 + ) transformers, accelerate, bitsandbytes, torch. A CUDA GPU enables
-true 4-bit; on a CPU / Apple-silicon 128 GB box a GGUF build (llama-cpp-python) is the
-recommended quantized path (same weights, same prompt) — see the notebook's hardware note.
+Requires: macOS on Apple silicon + `pip install mlx-lm` (plus numpy, pandas). ~__MEM__ of the
+128 GB unified memory holds the weights, leaving ample room for the KV-cache.
 
 Usage:
     python __SCRIPT__                 # validate (40 rows) + classify the 70 test rows
     python __SCRIPT__ --no-validate   # skip validation, just classify + submit
     python __SCRIPT__ --dry-run       # no model load: just print a sample prompt
-    HF_MODEL=... python __SCRIPT__    # override the model id
+    HF_MODEL=mlx-community/... python __SCRIPT__   # override the model id
 
 The corpus is a *combination*: ~1/3 char-obfuscated synthetic risk events (cyber=0 / financial=1)
 and ~2/3 the ISOT fake/real news set (fake clickbait=0 / real Reuters=1). The engineered prompt
@@ -138,30 +143,16 @@ __SYSTEM__
 __BUILD_SHOTS__
 
 
-# ── local model: load once, classify by 0-vs-1 next-token logits ───────────
+# ── Apple-silicon model (MLX): load once, classify by 0-vs-1 next-token logits ──
 _STATE = {"model": None, "tok": None, "zero": None, "one": None}
 
 
 def load_model(model_id=MODEL_ID):
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-    print(f"loading {model_id} ...")
-    tok = AutoTokenizer.from_pretrained(model_id)
-    kw = dict(low_cpu_mem_usage=True, device_map="auto")
-    if torch.cuda.is_available():
-        kw.update(torch_dtype=torch.bfloat16,
-                  quantization_config=BitsAndBytesConfig(
-                      load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                      bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16))
-    else:
-        kw.update(torch_dtype=torch.bfloat16)
-        print("WARNING: no CUDA GPU detected -> bitsandbytes 4-bit is unavailable. For a 128 GB "
-              "CPU / Apple-silicon box, run a GGUF build of this model via llama-cpp-python "
-              "(same weights, same prompt); loading in bfloat16 here may exceed 128 GB for 70B+ models.")
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kw).eval()
+    from mlx_lm import load
+    print(f"loading {model_id} (MLX / Apple-silicon Metal) ...")
+    model, tok = load(model_id)
     _STATE.update(model=model, tok=tok,
-                  zero=tok("0", add_special_tokens=False).input_ids[-1],
-                  one=tok("1", add_special_tokens=False).input_ids[-1])
+                  zero=tok.encode("0")[-1], one=tok.encode("1")[-1])
     return model, tok
 
 
@@ -170,20 +161,26 @@ def make_messages(text, system, shots):
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _encode(msgs):
+    tok = _STATE["tok"]
+    try:
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+        if isinstance(ids, str):
+            ids = tok.encode(ids)
+    except Exception:
+        ids = tok.encode(msgs[0]["content"] + "\\n\\n" + msgs[1]["content"])
+    return list(ids)[-MAX_INPUT_TOKENS:]
+
+
 def classify(text, shots, system=None):
-    import torch
+    import mlx.core as mx
     if system is None:
         system = SYSTEM
-    model, tok = _STATE["model"], _STATE["tok"]
-    msgs = make_messages(text, system, shots)
-    try:
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
-    except Exception:
-        ids = tok(system + "\\n\\n" + msgs[1]["content"], return_tensors="pt").input_ids
-    ids = ids[:, -MAX_INPUT_TOKENS:].to(model.device)
-    with torch.no_grad():
-        logits = model(ids).logits[0, -1]
-    return 0 if float(logits[_STATE["zero"]]) >= float(logits[_STATE["one"]]) else 1
+    ids = _encode(make_messages(text, system, shots))
+    logits = _STATE["model"](mx.array(ids)[None])[0, -1]
+    zero = float(logits[_STATE["zero"]].item())
+    one  = float(logits[_STATE["one"]].item())
+    return 0 if zero >= one else 1
 
 
 def classify_many(texts, shots, system=None):
@@ -219,7 +216,7 @@ def validate(rt_tr, shots, shot_idx, rng, per_quad=10):
 
 # ── main ───────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Local HF few-shot classifier for the RiskGuardian test set.")
+    ap = argparse.ArgumentParser(description="Local MLX few-shot classifier for the RiskGuardian test set.")
     ap.add_argument("--no-validate", action="store_true", help="skip the labeled-holdout validation pass")
     ap.add_argument("--dry-run", action="store_true", help="no model load: just print a sample prompt")
     ap.add_argument("--compare", default="submission2.csv", help="read-only: compare results against this CSV")
@@ -249,7 +246,7 @@ def main():
 
     sample = pd.read_csv(SAMPLE_CSV)
     pd.DataFrame({"id": rt_te["id"].values, "label": preds})[list(sample.columns)].to_csv(OUT_PATH, index=False)
-    print(f"\\nWrote {OUT_PATH} = {len(preds)} predictions ({MODEL_ID}, local few-shot prompting)")
+    print(f"\\nWrote {OUT_PATH} = {len(preds)} predictions ({MODEL_ID}, local MLX few-shot prompting)")
     print("label counts:", pd.Series(preds).value_counts().to_dict())
 
     cmp_path = args.compare
@@ -269,8 +266,8 @@ if __name__ == "__main__":
 '''
 
 
-def render_script(model_id, out_csv, slug, params, mem, desc, script_name):
-    s = HF_SCRIPT
+def render_script(model_id, out_csv, params, mem, desc, script_name):
+    s = MLX_SCRIPT
     s = s.replace("__LOAD_FRAMES__", LOAD_FRAMES)
     s = s.replace("__SYSTEM__", SYSTEM.rstrip("\n"))
     s = s.replace("__BUILD_SHOTS__", BUILD_SHOTS)
@@ -283,10 +280,13 @@ def render_script(model_id, out_csv, slug, params, mem, desc, script_name):
     return s
 
 
-# write the three standalone HF scripts to disk
+# remove the old transformers/bitsandbytes scripts; write the new MLX ones
+for old in OLD_SCRIPTS:
+    p = Path(old)
+    if p.exists():
+        p.unlink(); print("removed", old)
 for fname, model_id, slug, params, mem, desc in MODELS:
-    out_csv = f"submission2.{slug}.csv"
-    Path(fname).write_text(render_script(model_id, out_csv, slug, params, mem, desc, fname))
+    Path(fname).write_text(render_script(model_id, f"submission2.{slug}.csv", params, mem, desc, fname))
     print("wrote", fname)
 
 
@@ -315,46 +315,48 @@ def reuse(idx):
 def writefile_cell(path, blurb):
     body = Path(path).read_text()
     header = (f"# {blurb}\n"
-              f"# Full local HF few-shot classifier, inlined. `%%writefile` shows the code AND\n"
+              f"# Full local MLX few-shot classifier, inlined. `%%writefile` shows the code AND\n"
               f"# (re)materializes {path} WITHOUT executing it (no model load / no inference here).\n")
     return code(f"%%writefile {path}\n{header}\n{body}")
 
 
 cells = []
 
-# ART (reused from the top of submission.ipynb)
+# ART (reused, unchanged)
 cells.append(reuse(0))
 
-# Title + ROAD orientation
+# Title + ROAD orientation (Apple-silicon / MLX)
 cells.append(md(
-"""# <span style="color:#22442C">RiskGuardian — Few-Shot Prompting Submission (local Hugging Face edition)</span>
-### <em style="color:#7EA98B">Cyber (0) vs. Financial (1) — pure GenAI / prompt-engineering (FAQ&nbsp;#8), run entirely on-prem</em>
+"""# <span style="color:#22442C">RiskGuardian — Few-Shot Prompting Submission (Apple-silicon / MLX edition)</span>
+### <em style="color:#7EA98B">Cyber (0) vs. Financial (1) — pure GenAI / prompt-engineering (FAQ&nbsp;#8), run on-prem on a Mac</em>
 
 > **A local-only twin of [`submission.ipynb`](submission.ipynb).** Same engineered few-shot prompt, same
-> ROAD structure — but every prediction comes from an **open-weight Hugging Face model running on your own
-> 128&nbsp;GB box**, with no external API. Output: [`submission2.csv`](submission2.csv).
+> ROAD structure — but every prediction comes from an **open-weight model running on Apple silicon via
+> [MLX](https://github.com/ml-explore/mlx)**, with no external API and no CUDA. Output:
+> [`submission2.csv`](submission2.csv).
 
 This notebook follows the **ROAD** analytical format:
 
 | | Stage | What it answers |
 |---|---|---|
 | **R** | **Requirements** | What was asked, what the data *actually* is, and the success metric. |
-| **O** | **Operationalize** | The engineered few-shot prompt + the three local HF model scripts (inline). |
+| **O** | **Operationalize** | The engineered few-shot prompt + the three local MLX model scripts (inline). |
 | **A** | **Analysis** | Held-out validation, prompt-engineering lift, and the cross-model comparison. |
 | **D** | **Decision** | Which local model becomes `submission2.csv`, and why. |
 
 **Why this twin exists.** The API notebook proved the *method* (Claude Sonnet 4.5 → 100%). This one proves
-the method is **reproducible with open weights, fully offline** — useful when data can't leave the building.
-We pick the **three largest open instruct models that fit 128&nbsp;GB at 4-bit** and likely give solid results:
+it is **reproducible with open weights, fully offline, on a Mac** — the privacy-preserving path when data
+can't leave the building. We pick the **three largest open instruct models that fit a 128&nbsp;GB Mac at
+4-bit**, served as ready-to-run **MLX** conversions on the Hugging Face Hub:
 
-| Model | Params | ~4-bit footprint | Role |
+| Model (HF / mlx-community) | Params | ~4-bit footprint | Role |
 |---|---|---|---|
-| `mistralai/Mixtral-8x22B-Instruct-v0.1` | **141B** (sparse MoE, ≈39B active) | ≈80&nbsp;GB | largest |
-| `Qwen/Qwen2.5-72B-Instruct` | 72B dense | ≈42&nbsp;GB | default → `submission2.csv` |
-| `meta-llama/Llama-3.3-70B-Instruct` | 70B dense | ≈40&nbsp;GB | comparison |
+| `mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit` | **141B** (sparse MoE, ≈39B active) | ≈78&nbsp;GB | largest |
+| `mlx-community/Qwen2.5-72B-Instruct-4bit` | 72B dense | ≈40&nbsp;GB | default → `submission2.csv` |
+| `mlx-community/Llama-3.3-70B-Instruct-4bit` | 70B dense | ≈40&nbsp;GB | comparison |
 
 > **Honesty note.** Unlike `submission.ipynb` (whose API results are already computed), the accuracy /
-> agreement figures here are **produced when you run the cells locally** — they are intentionally left as
+> agreement figures here are **produced when you run the cells on the Mac** — they are intentionally left as
 > live computations, not pre-filled numbers.
 """))
 
@@ -364,7 +366,7 @@ cells.append(md(
 ## <span style="color:#40634A">R — Requirements</span>
 
 **The task is identical to `submission.ipynb`** — the data, labels, and metric do not change; only the
-*engine* (local HF models) does.
+*engine* (local MLX models on Apple silicon) does.
 
 Classify each row of `combined_risk_test.csv` as **0 = Cybersecurity** or **1 = Financial**, scored on
 **accuracy**, using **prompt engineering with a pre-trained LLM** (FAQ&nbsp;#8).
@@ -398,48 +400,50 @@ cells.append(md(
 The method is **engineered few-shot prompting** — a prompt that *encodes the discovered structure*: a system
 instruction naming both text types and their separate label rules, **eight few-shot examples spanning all
 four quadrants**, and a single-character output. The prompt is **byte-for-byte the same** as the API
-notebook; only the model backend changes.
+notebook; only the model backend changes (here: MLX on Apple silicon).
 """))
 cells.append(reuse(5))   # "The prompt-engineering story" markdown (shared)
 
-# Hardware / memory note
+# Hardware / memory note (Apple silicon / MLX)
 cells.append(md(
-"""### <em style="color:#7EA98B">Hardware & memory — fitting open weights in 128&nbsp;GB</em>
+"""### <em style="color:#7EA98B">Hardware & memory — open weights on a 128&nbsp;GB Mac (MLX)</em>
 
-Every model below is loaded with **4-bit (nf4) quantization** (`bitsandbytes`), which costs roughly
-**0.5&nbsp;bytes/parameter** plus a little overhead. That keeps even the 141B Mixtral MoE under ~80&nbsp;GB,
-leaving headroom for the KV-cache on a 128&nbsp;GB machine:
+**MLX** is Apple's array/ML framework; **`mlx-lm`** runs LLMs on the Mac's **unified memory** and **Metal**
+GPU. The models below are **4-bit MLX conversions** published on the Hugging Face Hub under
+`mlx-community`, so `mlx_lm.load("mlx-community/…")` downloads and runs them directly — **no CUDA, no
+bitsandbytes, no GGUF conversion step**. 4-bit costs roughly **0.5&nbsp;bytes/parameter**, so even the 141B
+Mixtral MoE sits well under the 128&nbsp;GB unified-memory budget:
 
-| Model | Params | 4-bit weights | Fits 128&nbsp;GB? |
+| Model | Params | 4-bit weights | Fits a 128&nbsp;GB Mac? |
 |---|---|---|---|
-| Mixtral-8x22B-Instruct | 141B (MoE) | ≈70 GB | ✅ (≈80 GB w/ overhead) |
-| Qwen2.5-72B-Instruct | 72B | ≈36 GB | ✅ comfortably |
-| Llama-3.3-70B-Instruct | 70B | ≈35 GB | ✅ comfortably |
+| Mixtral-8x22B-Instruct (MoE) | 141B | ≈70 GB | ✅ (≈78 GB w/ overhead) |
+| Qwen2.5-72B-Instruct | 72B | ≈38 GB | ✅ comfortably |
+| Llama-3.3-70B-Instruct | 70B | ≈36 GB | ✅ comfortably |
+
+> Recommended hardware: an Apple-silicon Mac with **128&nbsp;GB unified memory** (e.g. Mac&nbsp;Studio
+> M-series&nbsp;Ultra, or a 128&nbsp;GB MacBook&nbsp;Pro). For the 141B MoE, raise Metal's working-set limit
+> if needed: `sudo sysctl iogpu.wired_limit_mb=122880`.
 
 **Classification by logits, not free text.** Instead of generating and regex-parsing, we read the model's
-**next-token logits at the answer position and compare `"0"` vs `"1"`** — deterministic, single forward
+**next-token logits at the answer position and compare `"0"` vs `"1"`** — deterministic, a single forward
 pass, and it can never emit an unparseable answer (no `-1` failures).
 
-**Backends.** The scripts use `transformers` + `bitsandbytes`, which need a **CUDA GPU** for true 4-bit
-(weights live in VRAM and/or spill to the 128&nbsp;GB system RAM via `device_map="auto"`). On a **CPU /
-Apple-silicon 128&nbsp;GB** box, bitsandbytes 4-bit isn't available — there, run a **GGUF build of the same
-model via `llama-cpp-python`** (identical weights, identical prompt); 4-bit GGUF (Q4_K_M) has the same
-footprint and is the standard CPU/unified-memory path.
-
-**Dependencies:** `transformers`, `accelerate`, `bitsandbytes`, `torch` (plus `numpy`, `pandas`).
+**Dependencies:** macOS on Apple silicon + `pip install mlx-lm` (plus `numpy`, `pandas`).
 """))
 
-# In-notebook HF engine
+# In-notebook MLX engine
 cells.append(md(
-"""### <em style="color:#7EA98B">The in-notebook few-shot engine (local model)</em>
+"""### <em style="color:#7EA98B">The in-notebook few-shot engine (local MLX model)</em>
 
-Loads one model (default `Qwen/Qwen2.5-72B-Instruct`, override with the `HF_MODEL` env var), builds the
-few-shot bank, and exposes `classify` / `classify_many` used by the validation and prediction cells. The
-heavy line is `from_pretrained(...)` — it pulls/loads the weights once and can take several minutes.
+Loads one MLX model (default `mlx-community/Qwen2.5-72B-Instruct-4bit`, override with the `HF_MODEL` env
+var), builds the few-shot bank, and exposes `classify` / `classify_many` used by the validation and
+prediction cells. The heavy line is `mlx_lm.load(...)` — it pulls/loads the weights once (first run may
+download tens of GB) and maps them into unified memory.
 """))
-engine = f'''# ── GenAI predictor (local Hugging Face model): few-shot prompt classifier ──
-# Same engineered prompt as submission.ipynb, but every label comes from a LOCAL model.
-# Decision rule = compare next-token logits of "0" vs "1" (deterministic; never fails).
+engine = f'''# ── GenAI predictor (local Apple-silicon model via MLX): few-shot classifier ──
+# Same engineered prompt as submission.ipynb, but every label comes from a LOCAL MLX model
+# running on Apple silicon (unified memory / Metal). Decision rule = compare next-token logits
+# of "0" vs "1" (deterministic; never fails).
 import os, re
 import numpy as np, pandas as pd
 from pathlib import Path
@@ -477,35 +481,27 @@ SHOT_IDX = (pick((rt_tr.is_obf) & (rt_tr.label == 0), 2) +
 def trunc(t, n): return " ".join(str(t).split())[:n]
 SHOTS = "\\n\\n".join(f"TEXT: {{trunc(rt_tr.text[i], 300)}}\\nLABEL: {{int(rt_tr.label[i])}}" for i in SHOT_IDX)
 
-# ── load the model once (4-bit on GPU; spills to the 128 GB system RAM as needed) ──
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-print("loading", HF_MODEL, "... (first load pulls/initializes the weights; can take minutes)")
-_tok = AutoTokenizer.from_pretrained(HF_MODEL)
-_kw = dict(low_cpu_mem_usage=True, device_map="auto")
-if torch.cuda.is_available():
-    _kw.update(torch_dtype=torch.bfloat16,
-        quantization_config=BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
-            bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16))
-else:
-    _kw.update(torch_dtype=torch.bfloat16)
-    print("WARNING: no CUDA GPU -> 4-bit bitsandbytes unavailable. On a 128 GB CPU/Apple-silicon box, "
-          "use a GGUF build via llama-cpp-python (same weights & prompt). bf16 here may exceed 128 GB for 70B+.")
-_model = AutoModelForCausalLM.from_pretrained(HF_MODEL, **_kw).eval()
-_ZERO = _tok("0", add_special_tokens=False).input_ids[-1]
-_ONE  = _tok("1", add_special_tokens=False).input_ids[-1]
+# ── load the MLX model once (weights live in the Mac's unified memory) ──
+from mlx_lm import load
+import mlx.core as mx
+print("loading", HF_MODEL, "(MLX / Apple-silicon Metal) ... first run may download tens of GB")
+_model, _tok = load(HF_MODEL)
+_ZERO = _tok.encode("0")[-1]
+_ONE  = _tok.encode("1")[-1]
+
+def _encode(msgs):
+    try:
+        ids = _tok.apply_chat_template(msgs, add_generation_prompt=True)
+        if isinstance(ids, str): ids = _tok.encode(ids)
+    except Exception:
+        ids = _tok.encode(msgs[0]["content"] + "\\n\\n" + msgs[1]["content"])
+    return list(ids)[-MAX_INPUT_TOKENS:]
 
 def classify(text, system=SYSTEM, shots=SHOTS):
     user = (shots + "\\n\\n" if shots else "") + f"TEXT: {{trunc(text, 1500)}}\\nLABEL:"
     msgs = [{{"role": "system", "content": system}}, {{"role": "user", "content": user}}]
-    try:
-        ids = _tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
-    except Exception:
-        ids = _tok(system + "\\n\\n" + user, return_tensors="pt").input_ids
-    ids = ids[:, -MAX_INPUT_TOKENS:].to(_model.device)
-    with torch.no_grad():
-        logits = _model(ids).logits[0, -1]
-    return 0 if float(logits[_ZERO]) >= float(logits[_ONE]) else 1
+    logits = _model(mx.array(_encode(msgs))[None])[0, -1]
+    return 0 if float(logits[_ZERO].item()) >= float(logits[_ONE].item()) else 1
 
 def classify_many(texts, system=SYSTEM):
     return [classify(t, system=system) for t in texts]
@@ -515,9 +511,9 @@ print("smoke test (expect 1):", classify("Quarterly portfolio drawdown and liqui
 '''
 cells.append(code(engine))
 
-# three HF scripts inline
+# three MLX scripts inline
 cells.append(md(
-"""### <em style="color:#7EA98B">The three local-model few-shot scripts (inlined)</em>
+"""### <em style="color:#7EA98B">The three local MLX few-shot scripts (inlined)</em>
 
 The *same* engineered prompt, packaged as three standalone scripts — one per model — so each can be run from
 a shell and the results compared. Each is reproduced in full via `%%writefile`, which **shows the source and
@@ -525,10 +521,11 @@ a shell and the results compared. Each is reproduced in full via `%%writefile`, 
 `submission2.<model>.csv`; run them like:
 
 ```bash
-python riskguardian_hf_qwen_classifier.py        # -> submission2.qwen2.5-72b.csv
-python riskguardian_hf_llama_classifier.py       # -> submission2.llama-3.3-70b.csv
-python riskguardian_hf_mixtral_classifier.py     # -> submission2.mixtral-8x22b.csv
-HF_MODEL=Qwen/Qwen2.5-72B-Instruct python riskguardian_hf_qwen_classifier.py   # override freely
+pip install mlx-lm
+python riskguardian_mlx_qwen_classifier.py        # -> submission2.qwen2.5-72b.csv
+python riskguardian_mlx_llama_classifier.py       # -> submission2.llama-3.3-70b.csv
+python riskguardian_mlx_mixtral_classifier.py     # -> submission2.mixtral-8x22b.csv
+HF_MODEL=mlx-community/Qwen2.5-72B-Instruct-4bit python riskguardian_mlx_qwen_classifier.py   # override
 ```
 """))
 for fname, model_id, slug, params, mem, desc in MODELS:
@@ -546,13 +543,13 @@ Score the engineered prompt on a labeled holdout drawn evenly from all four quad
 examples), report per-quadrant accuracy, and measure the lift over a **naive** prompt. This runs the loaded
 local model, so expect it to take a few minutes; the numbers below are computed live (not pre-filled).
 """))
-cells.append(reuse(16))   # validation (shared signature: classify_many(vt, system=...))
-cells.append(reuse(17))   # caption (shared)
-cells.append(reuse(18))   # viz1: naive vs engineered (reuses nacc/eacc)
-cells.append(reuse(19))   # viz2: per-quadrant (reuses dfv)
+cells.append(reuse(17))   # validation (shared signature)
+cells.append(reuse(18))   # caption (shared)
+cells.append(reuse(19))   # viz1: naive vs engineered
+cells.append(reuse(20))   # viz2: per-quadrant
 
 cells.append(md(
-"""### <em style="color:#7EA98B">Cross-model comparison (local models)</em>
+"""### <em style="color:#7EA98B">Cross-model comparison (local MLX models)</em>
 
 Run all three scripts (above) to populate `submission2.<model>.csv`, then compare. The cell below loads
 whichever per-model CSVs exist alongside the primary `submission2.csv` and reports label splits and pairwise
@@ -560,106 +557,52 @@ agreement. With the API models, GLM-4.7 and GPT-5.3 agreed 70/70 (differing from
 the interesting question here is whether these *open* models converge the same way, and how they handle that
 same source-vs-content row. **The numbers populate once you've run the models.**
 """))
-cells.append(code(
-'''# ── Cross-model agreement, recomputed from the local submission CSVs (read-only) ──
-import csv
-from pathlib import Path
-
-FILES = {
-    "submission2.csv (primary)": "submission2.csv",
-    "Qwen2.5-72B":   "submission2.qwen2.5-72b.csv",
-    "Llama-3.3-70B": "submission2.llama-3.3-70b.csv",
-    "Mixtral-8x22B": "submission2.mixtral-8x22b.csv",
-}
-
-def load(path):
-    return {int(r["id"]): int(r["label"]) for r in csv.DictReader(open(path))}
-
-preds = {name: load(p) for name, p in FILES.items() if Path(p).exists()}
-if not preds:
-    print("No submission2*.csv yet — run the Decision cell and/or the three scripts first.")
-else:
-    ids = sorted(next(iter(preds.values())))
-    print("label split per model (0=cyber/fake, 1=financial/real):")
-    for name, d in preds.items():
-        v = list(d.values()); print(f"  {name:26s} {{0: {v.count(0)}, 1: {v.count(1)}}}")
-    names = list(preds)
-    if len(names) > 1:
-        print("\\npairwise agreement / 70:")
-        for i in range(len(names)):
-            for j in range(i + 1, len(names)):
-                a, b = preds[names[i]], preds[names[j]]
-                agree = sum(a[k] == b[k] for k in ids)
-                diffs = [k for k in ids if a[k] != b[k]]
-                print(f"  {names[i]:26s} vs {names[j]:26s}: {agree}/70" +
-                      (f"   (disagree on ids {diffs})" if diffs else "   (identical)"))
-'''))
+cells.append(reuse(22))   # cross-model agreement code (shared; stdlib only)
 
 # ═════════════════════════ D — DECISION ═════════════════════════════════════
 cells.append(md(
 """---
 ## <span style="color:#40634A">D — Decision</span>
 
-**`submission2.csv` is written by the loaded local model** (default `Qwen/Qwen2.5-72B-Instruct`) — pure
-GenAI, no classical model in the prediction path (FAQ&nbsp;#8). To promote a different local model to the
-official `submission2.csv`, set `HF_MODEL` before running the in-notebook engine, e.g.:
+**`submission2.csv` is written by the loaded local MLX model** (default
+`mlx-community/Qwen2.5-72B-Instruct-4bit`) — pure GenAI, no classical model in the prediction path
+(FAQ&nbsp;#8). To promote a different local model to the official `submission2.csv`, set `HF_MODEL` before
+running the in-notebook engine, e.g.:
 
 ```bash
-HF_MODEL=mistralai/Mixtral-8x22B-Instruct-v0.1 jupyter nbconvert --execute submission2.ipynb
+HF_MODEL=mlx-community/Mixtral-8x22B-Instruct-v0.1-4bit jupyter nbconvert --execute submission2.ipynb
 ```
 
 **How to choose between the three:** pick the model with the best **held-out validation accuracy** from the
 Analysis section (all four quadrants), breaking ties toward the model that reads **id&nbsp;37** as the
-*source-based* `0` — that is the row that distinguishes provenance-reasoning from surface-plausibility, and
-the one the API notebook's perfect score confirmed as `0`. The cell below runs the chosen model over the 70
-test rows and writes `submission2.csv`.
+*source-based* `0` — the row that distinguishes provenance-reasoning from surface-plausibility, and the one
+the API notebook's perfect score confirmed as `0`. The cell below runs the chosen model over the 70 test
+rows and writes `submission2.csv`.
 """))
-cells.append(code(
-'''# ── Predict the 70 test rows with the local model = submission2.csv ─────
-# Pure GenAI / prompt engineering (FAQ #8): the local LLM is the SOLE source of every label.
-print("Classifying 70 test rows with", HF_MODEL, "...")
-preds = np.array(classify_many(rt_te["text"].tolist(), system=SYSTEM)).astype(int)
-
-sample = pd.read_csv("Sample_Submission.csv")
-out = pd.DataFrame({"id": rt_te["id"].values, "label": preds})[list(sample.columns)]
-out.to_csv("submission2.csv", index=False)
-
-# Validate the submission FORMAT (FAQ #1, #2).
-checks = {
-    "exactly 2 columns":              out.shape[1] == 2,
-    f"columns == {list(sample.columns)}": list(out.columns) == list(sample.columns),
-    "row count == 70":                len(out) == 70,
-    "ids match test set (and order)": list(out["id"]) == list(rt_te["id"]),
-    "labels in {0,1}":                set(int(v) for v in out["label"].unique()) <= {0, 1},
-}
-for k, v in checks.items(): print("PASS" if v else "FAIL", "-", k)
-print(f"\\nWrote submission2.csv = {len(preds)} predictions ({HF_MODEL}, local few-shot prompting)")
-print("label counts:", pd.Series(preds).value_counts().to_dict())
-display(out.head(8))
-'''))
+cells.append(reuse(24))   # predict + write submission2.csv (shared)
 
 cells.append(md(
 """### <em style="color:#7EA98B">Decision summary & repository map</em>
 
-- **Submit:** `submission2.csv` — written locally by the chosen open model (default Qwen2.5-72B-Instruct),
-  few-shot prompting, **0 external API calls**.
-- **Why local:** identical method to the winning `submission.csv`, but fully offline — the privacy-preserving
-  path when data can't leave the building.
+- **Submit:** `submission2.csv` — written locally by the chosen MLX model (default Qwen2.5-72B-Instruct-4bit),
+  few-shot prompting, **0 external API calls**, entirely on Apple silicon.
+- **Why local / MLX:** identical method to the winning `submission.csv`, but fully offline on a Mac — the
+  privacy-preserving path when data can't leave the building.
 - **Model choice:** decide from the held-out validation; the three candidates are the largest open instruct
-  models that fit 128&nbsp;GB at 4-bit.
+  models that fit a 128&nbsp;GB Mac at 4-bit.
 
 | Path | What it is |
 |---|---|
-| [`submission2.csv`](submission2.csv) | **Local submission** — chosen HF model, pure GenAI (`id,label`) |
+| [`submission2.csv`](submission2.csv) | **Local submission** — chosen MLX model, pure GenAI (`id,label`) |
 | `submission2.qwen2.5-72b.csv` / `…llama-3.3-70b.csv` / `…mixtral-8x22b.csv` | per-model outputs (comparison) |
-| `riskguardian_hf_qwen_classifier.py` | Qwen2.5-72B-Instruct (72B) few-shot classifier |
-| `riskguardian_hf_llama_classifier.py` | Llama-3.3-70B-Instruct (70B) few-shot classifier |
-| `riskguardian_hf_mixtral_classifier.py` | Mixtral-8x22B-Instruct (141B MoE) few-shot classifier |
+| `riskguardian_mlx_qwen_classifier.py` | Qwen2.5-72B-Instruct-4bit (72B) few-shot classifier |
+| `riskguardian_mlx_llama_classifier.py` | Llama-3.3-70B-Instruct-4bit (70B) few-shot classifier |
+| `riskguardian_mlx_mixtral_classifier.py` | Mixtral-8x22B-Instruct-v0.1-4bit (141B MoE) few-shot classifier |
 | [`submission.ipynb`](submission.ipynb) | the API twin (Claude/GLM/GPT) this notebook mirrors |
 
 ---
-*Local Hugging Face edition of the RiskGuardian few-shot-prompting summary. Same engineered prompt, same ROAD
-order — open weights, on-prem, `submission2.csv`.*
+*Apple-silicon / MLX edition of the RiskGuardian few-shot-prompting summary. Same engineered prompt, same
+ROAD order — open weights, on-device, `submission2.csv`.*
 """))
 
 # write

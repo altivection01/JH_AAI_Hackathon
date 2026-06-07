@@ -1,26 +1,27 @@
 #!/usr/bin/env python
 """
-RiskGuardian — GenAI predictor: few-shot classification with a LOCAL Hugging Face model.
+RiskGuardian — GenAI predictor: few-shot classification on Apple silicon via MLX.
 
 Qwen2.5-72B-Instruct — a very strong dense instruct model; excellent at constrained classification.
 
-Runs the SAME engineered few-shot prompt as the API classifiers, but entirely LOCAL via
-`transformers` with 4-bit (nf4) quantization, so the model fits in 128 GB. The label is
-decided by comparing the next-token logits of "0" vs "1" — deterministic, and it never fails.
+Runs the SAME engineered few-shot prompt as the API classifiers, fully LOCAL on Apple silicon
+via MLX (mlx-lm). The model is a 4-bit MLX conversion on the Hugging Face Hub (mlx-community),
+so it loads straight from HF and runs on the Mac's unified memory / Metal GPU — no CUDA, no
+bitsandbytes. The label is decided by comparing the next-token logits of "0" vs "1":
+deterministic, a single forward pass, and it never emits an unparseable answer.
 Writes:
     submission2.qwen2.5-72b.csv   <- predictions (pure GenAI / FAQ #8; no classical fallback)
 
-Model: Qwen/Qwen2.5-72B-Instruct   (72B dense, ≈42 GB at 4-bit nf4)
+Model: mlx-community/Qwen2.5-72B-Instruct-4bit   (72B dense, ≈40 GB at 4-bit)
 
-Requires (MLENV311 + ) transformers, accelerate, bitsandbytes, torch. A CUDA GPU enables
-true 4-bit; on a CPU / Apple-silicon 128 GB box a GGUF build (llama-cpp-python) is the
-recommended quantized path (same weights, same prompt) — see the notebook's hardware note.
+Requires: macOS on Apple silicon + `pip install mlx-lm` (plus numpy, pandas). ~≈40 GB of the
+128 GB unified memory holds the weights, leaving ample room for the KV-cache.
 
 Usage:
-    python riskguardian_hf_qwen_classifier.py                 # validate (40 rows) + classify the 70 test rows
-    python riskguardian_hf_qwen_classifier.py --no-validate   # skip validation, just classify + submit
-    python riskguardian_hf_qwen_classifier.py --dry-run       # no model load: just print a sample prompt
-    HF_MODEL=... python riskguardian_hf_qwen_classifier.py    # override the model id
+    python riskguardian_mlx_qwen_classifier.py                 # validate (40 rows) + classify the 70 test rows
+    python riskguardian_mlx_qwen_classifier.py --no-validate   # skip validation, just classify + submit
+    python riskguardian_mlx_qwen_classifier.py --dry-run       # no model load: just print a sample prompt
+    HF_MODEL=mlx-community/... python riskguardian_mlx_qwen_classifier.py   # override the model id
 
 The corpus is a *combination*: ~1/3 char-obfuscated synthetic risk events (cyber=0 / financial=1)
 and ~2/3 the ISOT fake/real news set (fake clickbait=0 / real Reuters=1). The engineered prompt
@@ -36,7 +37,7 @@ TRAIN_CSV  = "combined_risk_train.csv"
 TEST_CSV   = "combined_risk_test.csv"
 SAMPLE_CSV = "Sample_Submission.csv"
 
-MODEL_ID = os.environ.get("HF_MODEL", "Qwen/Qwen2.5-72B-Instruct")
+MODEL_ID = os.environ.get("HF_MODEL", "mlx-community/Qwen2.5-72B-Instruct-4bit")
 OUT_PATH = "submission2.qwen2.5-72b.csv"
 MAX_INPUT_TOKENS = int(os.environ.get("HF_MAX_INPUT_TOKENS", "8192"))
 
@@ -92,30 +93,16 @@ def build_shots(rt_tr, seed=7):
     return shot_idx, shots, rng
 
 
-# ── local model: load once, classify by 0-vs-1 next-token logits ───────────
+# ── Apple-silicon model (MLX): load once, classify by 0-vs-1 next-token logits ──
 _STATE = {"model": None, "tok": None, "zero": None, "one": None}
 
 
 def load_model(model_id=MODEL_ID):
-    import torch
-    from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-    print(f"loading {model_id} ...")
-    tok = AutoTokenizer.from_pretrained(model_id)
-    kw = dict(low_cpu_mem_usage=True, device_map="auto")
-    if torch.cuda.is_available():
-        kw.update(torch_dtype=torch.bfloat16,
-                  quantization_config=BitsAndBytesConfig(
-                      load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                      bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16))
-    else:
-        kw.update(torch_dtype=torch.bfloat16)
-        print("WARNING: no CUDA GPU detected -> bitsandbytes 4-bit is unavailable. For a 128 GB "
-              "CPU / Apple-silicon box, run a GGUF build of this model via llama-cpp-python "
-              "(same weights, same prompt); loading in bfloat16 here may exceed 128 GB for 70B+ models.")
-    model = AutoModelForCausalLM.from_pretrained(model_id, **kw).eval()
+    from mlx_lm import load
+    print(f"loading {model_id} (MLX / Apple-silicon Metal) ...")
+    model, tok = load(model_id)
     _STATE.update(model=model, tok=tok,
-                  zero=tok("0", add_special_tokens=False).input_ids[-1],
-                  one=tok("1", add_special_tokens=False).input_ids[-1])
+                  zero=tok.encode("0")[-1], one=tok.encode("1")[-1])
     return model, tok
 
 
@@ -124,20 +111,26 @@ def make_messages(text, system, shots):
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _encode(msgs):
+    tok = _STATE["tok"]
+    try:
+        ids = tok.apply_chat_template(msgs, add_generation_prompt=True)
+        if isinstance(ids, str):
+            ids = tok.encode(ids)
+    except Exception:
+        ids = tok.encode(msgs[0]["content"] + "\n\n" + msgs[1]["content"])
+    return list(ids)[-MAX_INPUT_TOKENS:]
+
+
 def classify(text, shots, system=None):
-    import torch
+    import mlx.core as mx
     if system is None:
         system = SYSTEM
-    model, tok = _STATE["model"], _STATE["tok"]
-    msgs = make_messages(text, system, shots)
-    try:
-        ids = tok.apply_chat_template(msgs, add_generation_prompt=True, return_tensors="pt")
-    except Exception:
-        ids = tok(system + "\n\n" + msgs[1]["content"], return_tensors="pt").input_ids
-    ids = ids[:, -MAX_INPUT_TOKENS:].to(model.device)
-    with torch.no_grad():
-        logits = model(ids).logits[0, -1]
-    return 0 if float(logits[_STATE["zero"]]) >= float(logits[_STATE["one"]]) else 1
+    ids = _encode(make_messages(text, system, shots))
+    logits = _STATE["model"](mx.array(ids)[None])[0, -1]
+    zero = float(logits[_STATE["zero"]].item())
+    one  = float(logits[_STATE["one"]].item())
+    return 0 if zero >= one else 1
 
 
 def classify_many(texts, shots, system=None):
@@ -173,7 +166,7 @@ def validate(rt_tr, shots, shot_idx, rng, per_quad=10):
 
 # ── main ───────────────────────────────────────────────────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Local HF few-shot classifier for the RiskGuardian test set.")
+    ap = argparse.ArgumentParser(description="Local MLX few-shot classifier for the RiskGuardian test set.")
     ap.add_argument("--no-validate", action="store_true", help="skip the labeled-holdout validation pass")
     ap.add_argument("--dry-run", action="store_true", help="no model load: just print a sample prompt")
     ap.add_argument("--compare", default="submission2.csv", help="read-only: compare results against this CSV")
@@ -203,7 +196,7 @@ def main():
 
     sample = pd.read_csv(SAMPLE_CSV)
     pd.DataFrame({"id": rt_te["id"].values, "label": preds})[list(sample.columns)].to_csv(OUT_PATH, index=False)
-    print(f"\nWrote {OUT_PATH} = {len(preds)} predictions ({MODEL_ID}, local few-shot prompting)")
+    print(f"\nWrote {OUT_PATH} = {len(preds)} predictions ({MODEL_ID}, local MLX few-shot prompting)")
     print("label counts:", pd.Series(preds).value_counts().to_dict())
 
     cmp_path = args.compare
